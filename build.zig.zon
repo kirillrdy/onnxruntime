@@ -1,0 +1,66 @@
+.{
+    .name = .onnxruntime,
+    .version = "1.24.4",
+    .fingerprint = 0xc45be4c78438d87c,
+    .minimum_zig_version = "0.16.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "sources.zig",
+        "README.md",
+    },
+    .dependencies = .{
+        .ort_src = .{
+            .url = "https://github.com/microsoft/onnxruntime/archive/refs/tags/v1.24.4.tar.gz",
+            .hash = "N-V-__8AAHeQ9SYehEdjgwA4mQ96PAEYTCedTWCxtYHYmzw3",
+        },
+        .protobuf = .{
+            .url = "https://github.com/protocolbuffers/protobuf/archive/refs/tags/v21.12.zip",
+            .hash = "N-V-__8AAKQRCwJCHUJJSS8JLEalW8xIIOxP7dRYEs9c0kNH",
+        },
+        .onnx = .{
+            .url = "https://github.com/onnx/onnx/archive/refs/tags/v1.20.1.zip",
+            .hash = "N-V-__8AALBV8QHMSuOcWFqqTTFHSOyRYwlMFCqT647NHICa",
+        },
+        .abseil = .{
+            .url = "https://github.com/abseil/abseil-cpp/archive/refs/tags/20250814.0.zip",
+            .hash = "N-V-__8AANpzoACr_luVW-p-utGFsuX-Ekon6vvzTpjUn38T",
+        },
+        .re2 = .{
+            .url = "https://github.com/google/re2/archive/refs/tags/2024-07-02.zip",
+            .hash = "N-V-__8AAHhGGQAsljHC8FH2UWnASjSpVsOT-fBS7IwRoFzL",
+        },
+        .flatbuffers = .{
+            .url = "https://github.com/google/flatbuffers/archive/refs/tags/v23.5.26.zip",
+            .hash = "N-V-__8AAHravQDuVs-wMIucvOclKrQDoqIcaqg2DqzYJFSf",
+        },
+        .cpuinfo = .{
+            .url = "https://github.com/pytorch/cpuinfo/archive/403d652dca4c1046e8145950b1c0997a9f748b57.zip",
+            .hash = "N-V-__8AAIfONQHZNPh4P3XpcVIencgrhD5i_91h_bczdfnD",
+        },
+        .date = .{
+            .url = "https://github.com/HowardHinnant/date/archive/refs/tags/v3.0.1.zip",
+            .hash = "N-V-__8AAAw4HgBpPpPHToufM_SIrIdjxtMCPOVFBn7lNdr6",
+        },
+        .gsl = .{
+            .url = "https://github.com/microsoft/GSL/archive/refs/tags/v4.0.0.zip",
+            .hash = "N-V-__8AAB0RBQD6ubpGeQI4QaivEIuC_VHpq_1mQt0tSQXB",
+        },
+        .mp11 = .{
+            .url = "https://github.com/boostorg/mp11/archive/refs/tags/boost-1.82.0.zip",
+            .hash = "N-V-__8AAAAdDAAy_mkw2eI3n4wlKB2TIMJiIypCtVwI0IeX",
+        },
+        .safeint = .{
+            .url = "https://github.com/dcleblanc/SafeInt/archive/refs/tags/3.0.28.zip",
+            .hash = "N-V-__8AAN88QwAEhNIhig5hoo7vK0njj7uu7Q4iap54ktOx",
+        },
+        .json = .{
+            .url = "https://github.com/nlohmann/json/archive/refs/tags/v3.12.0.tar.gz",
+            .hash = "N-V-__8AANqC8wBtv10C_41rBAgWfTMpQow7tzRi4h6LQYxm",
+        },
+        .ort_eigen = .{
+            .url = "https://gitlab.com/libeigen/eigen/-/archive/1d8b82b0740839c0de7f1242a3585e3390ff5f33/eigen-1d8b82b0740839c0de7f1242a3585e3390ff5f33.tar.gz",
+            .hash = "N-V-__8AAN2YAQHtb4uGS3lW6pQGY_b87n6uwg1_SoL9slvT",
+        },
+    },
+}
