@@ -91,6 +91,7 @@ pub fn library(
         ort.path(b, "onnxruntime"),
         ort.path(b, "onnxruntime/core/mlas/inc"),
         ort.path(b, "onnxruntime/core/mlas/lib"),
+        ort.path(b, "model_package/include"),
         onnx,
         abseil,
         re2,
@@ -127,6 +128,11 @@ pub fn library(
     lib_mod.addCSourceFiles(.{ .root = protobuf, .files = &sources.protobuf_lite_sources, .flags = flags });
     lib_mod.addCSourceFiles(.{ .root = cpuinfo, .files = &sources.cpuinfo_sources, .flags = ortCFlags(b) });
     lib_mod.addCSourceFile(.{ .file = cpu_features, .flags = &.{"-std=c11"} });
+    lib_mod.addCSourceFiles(.{
+        .root = ort.path(b, "model_package"),
+        .files = &sources.model_package_sources,
+        .flags = flags,
+    });
 
     const ort_root = ort.path(b, "onnxruntime");
     inline for (.{
@@ -163,10 +169,11 @@ pub fn library(
             .link_libcpp = true,
         });
         for (includes) |include| group_mod.addIncludePath(include);
+        const group_flags = concatFlags(b, &.{ "-fvisibility=hidden", "-fvisibility-inlines-hidden" }, group.flags);
         group_mod.addCSourceFiles(.{
             .root = ort_root,
             .files = group.files,
-            .flags = concatFlags(b, flags, &.{ "-fvisibility=hidden", "-fvisibility-inlines-hidden" }),
+            .flags = concatFlags(b, flags, group_flags),
         });
         group_libs.append(b.allocator, b.addLibrary(.{
             .name = b.fmt("onnxruntime-mlas-{d}", .{index}),
@@ -197,7 +204,7 @@ fn concatFlags(b: *std.Build, base: []const []const u8, extra: []const []const u
 
 fn ortFlags(b: *std.Build) []const []const u8 {
     return b.allocator.dupe([]const u8, &.{
-        "-std=c++17",
+        "-std=c++20",
         "-fno-rtti",
         "-DCPUINFO_SUPPORTED",
         "-DCPUINFO_SUPPORTED_PLATFORM=1",
@@ -253,7 +260,7 @@ const ort_config_header =
     \\#define HAS_UNUSED_BUT_SET_VARIABLE
     \\#define HAS_UNUSED_VARIABLE
     \\#define ORT_BUILD_INFO "ORT Build Info: built by build.zig"
-    \\#define ORT_VERSION "1.24.4"
+    \\#define ORT_VERSION "1.29.0"
     \\
 ;
 
