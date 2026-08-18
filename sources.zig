@@ -185,6 +185,10 @@ pub const FileFlags = struct {
     flags: []const []const u8,
 };
 
+// Sources needing flags of their own. Zig's addCSourceFiles appends rather
+// than overrides, so a file listed here must NOT also appear in a list above:
+// both objects would land in the archive and the linker would resolve against
+// the first one added, silently discarding the flags.
 pub const ort_file_flags = [_]FileFlags{
     .{ .file = "core/common/spin_pause.cc", .flags = &.{"-mwaitpkg"} },
 };
@@ -438,7 +442,6 @@ pub const ort_common_sources = [_][]const u8{
     "core/common/profiler.cc",
     "core/common/profiler_common.cc",
     "core/common/semver.cc",
-    "core/common/spin_pause.cc",
     "core/common/status.cc",
     "core/common/threadpool.cc",
     "core/platform/check_intel.cc",

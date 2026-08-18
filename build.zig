@@ -17,6 +17,7 @@
 
 const std = @import("std");
 const sources = @import("sources.zig");
+const build_zon = @import("build.zig.zon");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -25,28 +26,46 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(library(b, target, optimize));
 }
 
-pub fn buildProtoc(b: *std.Build, protobuf: std.Build.LazyPath, optimize: std.builtin.OptimizeMode) *std.Build.Step.Compile {
-    const protoc_mod = b.createModule(.{
-        .target = b.graph.host,
+/// A module compiled as C++ against Zig's libc++, seeded with `includes`.
+/// Every module here wants the same libc/libc++ treatment; only the resolved
+/// target and the include set differ.
+fn cxxModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    includes: []const std.Build.LazyPath,
+) *std.Build.Module {
+    const mod = b.createModule(.{
+        .target = target,
         .optimize = optimize,
         .link_libc = true,
         .link_libcpp = true,
     });
-    protoc_mod.addIncludePath(protobuf.path(b, "src"));
+    for (includes) |include| mod.addIncludePath(include);
+    return mod;
+}
+
+fn buildProtoc(b: *std.Build, protobuf: std.Build.LazyPath) *std.Build.Step.Compile {
+    // Pinned rather than inherited from the caller: this protoc runs three
+    // times on three small .proto files, so codegen quality buys nothing, and
+    // -Os builds protobuf roughly twice as fast as any other mode. Pinning
+    // also keeps the whole 167-file host build out of the consumer's
+    // -Doptimize cache key, so it is paid once per host instead of per mode.
+    const protoc_mod = cxxModule(b, b.graph.host, .ReleaseSmall, &.{protobuf.path(b, "src")});
     const flags = [_][]const u8{
         "-std=c++17",
         "-DGOOGLE_PROTOBUF_CMAKE_BUILD",
         "-DHAVE_ZLIB=0",
         "-w",
     };
-    inline for (.{ &sources.protobuf_lite_sources, &sources.protobuf_full_sources, &sources.protoc_sources }) |list| {
+    for ([_][]const []const u8{
+        &sources.protobuf_lite_sources,
+        &sources.protobuf_full_sources,
+        &sources.protoc_sources,
+        &.{"src/google/protobuf/compiler/main.cc"},
+    }) |list| {
         protoc_mod.addCSourceFiles(.{ .root = protobuf, .files = list, .flags = &flags });
     }
-    protoc_mod.addCSourceFiles(.{
-        .root = protobuf,
-        .files = &.{"src/google/protobuf/compiler/main.cc"},
-        .flags = &flags,
-    });
     return b.addExecutable(.{ .name = "protoc", .root_module = protoc_mod });
 }
 
@@ -74,21 +93,24 @@ pub fn library(
     const abseil = b.dependency("abseil", .{}).path(".");
     const re2 = b.dependency("re2", .{}).path(".");
     const cpuinfo = b.dependency("cpuinfo", .{}).path(".");
+    const ort_root = ort.path(b, "onnxruntime");
 
     const config = b.addWriteFiles();
-    _ = config.add("onnxruntime_config.h", ort_config_header);
-    const cpu_features = config.add("cpu_features2.c", ort_cpu_features2);
+    _ = config.add("onnxruntime_config.h", b.fmt(ort_config_header, .{build_zon.version}));
 
     // protoc runs during the build, so it is built for the host even when the
     // runtime itself is cross-compiled.
-    const protos = generateOnnxProto(b, buildProtoc(b, protobuf, optimize), onnx);
+    const protos = generateOnnxProto(b, buildProtoc(b, protobuf), onnx);
 
-    const includes = b.allocator.dupe(std.Build.LazyPath, &.{
+    // Deliberately excludes `protos`. A generated include path is a step
+    // dependency, so listing it here would park all of mlas behind protoc
+    // instead of letting the two run at once; only the runtime proper needs
+    // the generated headers, and it adds them for itself below.
+    const includes = [_]std.Build.LazyPath{
         config.getDirectory(),
-        protos,
         ort.path(b, "include/onnxruntime"),
         ort.path(b, "include/onnxruntime/core/session"),
-        ort.path(b, "onnxruntime"),
+        ort_root,
         ort.path(b, "onnxruntime/core/mlas/inc"),
         ort.path(b, "onnxruntime/core/mlas/lib"),
         ort.path(b, "model_package/include"),
@@ -105,37 +127,28 @@ pub fn library(
         b.dependency("mp11", .{}).path("include"),
         b.dependency("safeint", .{}).path("."),
         b.dependency("json", .{}).path("single_include"),
-    }) catch @panic("OOM");
+    };
 
-    const lib_mod = b.createModule(.{
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-        .link_libcpp = true,
-    });
-    for (includes) |include| lib_mod.addIncludePath(include);
+    const lib_mod = cxxModule(b, target, optimize, &includes);
+    lib_mod.addIncludePath(protos);
 
-    const flags = ortFlags(b);
-
-    lib_mod.addCSourceFiles(.{ .root = protos, .files = &sources.onnx_proto_sources, .flags = flags });
+    lib_mod.addCSourceFiles(.{ .root = protos, .files = &sources.onnx_proto_sources, .flags = &ort_flags });
     lib_mod.addCSourceFiles(.{
         .root = onnx,
         .files = &sources.onnx_sources,
-        .flags = concatFlags(b, flags, &.{"-D__ONNX_DISABLE_STATIC_REGISTRATION"}),
+        .flags = concatFlags(b, &.{ &ort_flags, &.{"-D__ONNX_DISABLE_STATIC_REGISTRATION"} }),
     });
-    lib_mod.addCSourceFiles(.{ .root = abseil, .files = &sources.abseil_sources, .flags = flags });
-    lib_mod.addCSourceFiles(.{ .root = re2, .files = &sources.re2_sources, .flags = flags });
-    lib_mod.addCSourceFiles(.{ .root = protobuf, .files = &sources.protobuf_lite_sources, .flags = flags });
-    lib_mod.addCSourceFiles(.{ .root = cpuinfo, .files = &sources.cpuinfo_sources, .flags = ortCFlags(b) });
-    lib_mod.addCSourceFile(.{ .file = cpu_features, .flags = &.{"-std=c11"} });
+    lib_mod.addCSourceFiles(.{ .root = abseil, .files = &sources.abseil_sources, .flags = &ort_flags });
+    lib_mod.addCSourceFiles(.{ .root = re2, .files = &sources.re2_sources, .flags = &ort_flags });
+    lib_mod.addCSourceFiles(.{ .root = protobuf, .files = &sources.protobuf_lite_sources, .flags = &ort_flags });
+    lib_mod.addCSourceFiles(.{ .root = cpuinfo, .files = &sources.cpuinfo_sources, .flags = &ort_c_flags });
     lib_mod.addCSourceFiles(.{
         .root = ort.path(b, "model_package"),
         .files = &sources.model_package_sources,
-        .flags = flags,
+        .flags = &ort_flags,
     });
 
-    const ort_root = ort.path(b, "onnxruntime");
-    inline for (.{
+    for ([_][]const []const u8{
         &sources.ort_common_sources,
         &sources.ort_graph_sources,
         &sources.ort_framework_sources,
@@ -147,39 +160,14 @@ pub fn library(
         &sources.ort_flatbuffers_sources,
         &sources.ort_mlas_sources,
     }) |list| {
-        lib_mod.addCSourceFiles(.{ .root = ort_root, .files = list, .flags = flags });
+        lib_mod.addCSourceFiles(.{ .root = ort_root, .files = list, .flags = &ort_flags });
     }
     for (sources.ort_file_flags) |override| {
         lib_mod.addCSourceFiles(.{
             .root = ort_root,
             .files = &.{override.file},
-            .flags = concatFlags(b, flags, override.flags),
+            .flags = concatFlags(b, &.{ &ort_flags, override.flags }),
         });
-    }
-
-    var group_libs: std.ArrayList(*std.Build.Step.Compile) = .empty;
-    for (sources.ort_mlas_groups, 0..) |group, index| {
-        var query = target.query;
-        for (group.features) |feature| query.cpu_features_add.addFeature(@intFromEnum(feature));
-
-        const group_mod = b.createModule(.{
-            .target = b.resolveTargetQuery(query),
-            .optimize = optimize,
-            .link_libc = true,
-            .link_libcpp = true,
-        });
-        for (includes) |include| group_mod.addIncludePath(include);
-        const group_flags = concatFlags(b, &.{ "-fvisibility=hidden", "-fvisibility-inlines-hidden" }, group.flags);
-        group_mod.addCSourceFiles(.{
-            .root = ort_root,
-            .files = group.files,
-            .flags = concatFlags(b, flags, group_flags),
-        });
-        group_libs.append(b.allocator, b.addLibrary(.{
-            .name = b.fmt("onnxruntime-mlas-{d}", .{index}),
-            .linkage = .static,
-            .root_module = group_mod,
-        })) catch @panic("OOM");
     }
 
     const lib = b.addLibrary(.{
@@ -187,7 +175,23 @@ pub fn library(
         .linkage = .static,
         .root_module = lib_mod,
     });
-    for (group_libs.items) |group_lib| lib.root_module.linkLibrary(group_lib);
+
+    for (sources.ort_mlas_groups, 0..) |group, index| {
+        var query = target.query;
+        for (group.features) |feature| query.cpu_features_add.addFeature(@intFromEnum(feature));
+
+        const group_mod = cxxModule(b, b.resolveTargetQuery(query), optimize, &includes);
+        group_mod.addCSourceFiles(.{
+            .root = ort_root,
+            .files = group.files,
+            .flags = concatFlags(b, &.{ &ort_flags, &mlas_group_flags, group.flags }),
+        });
+        lib.root_module.linkLibrary(b.addLibrary(.{
+            .name = b.fmt("onnxruntime-mlas-{d}", .{index}),
+            .linkage = .static,
+            .root_module = group_mod,
+        }));
+    }
 
     // Travels with the artifact: a module that links this library gets the C
     // API headers on its include path without naming a path itself.
@@ -195,49 +199,48 @@ pub fn library(
     return lib;
 }
 
-fn concatFlags(b: *std.Build, base: []const []const u8, extra: []const []const u8) []const []const u8 {
-    const all = b.allocator.alloc([]const u8, base.len + extra.len) catch @panic("OOM");
-    @memcpy(all[0..base.len], base);
-    @memcpy(all[base.len..], extra);
-    return all;
+fn concatFlags(b: *std.Build, parts: []const []const []const u8) []const []const u8 {
+    return std.mem.concat(b.allocator, []const u8, parts) catch @panic("OOM");
 }
 
-fn ortFlags(b: *std.Build) []const []const u8 {
-    return b.allocator.dupe([]const u8, &.{
-        "-std=c++20",
-        "-fno-rtti",
-        "-DCPUINFO_SUPPORTED",
-        "-DCPUINFO_SUPPORTED_PLATFORM=1",
-        "-DEIGEN_MPL2_ONLY",
-        "-DEIGEN_USE_THREADS",
-        "-DENABLE_CPU_FP16_TRAINING_OPS",
-        "-D_GNU_SOURCE",
-        "-DONLY_C_LOCALE=0",
-        "-DONNX_ML=1",
-        "-DONNX_NAMESPACE=onnx",
-        "-D__ONNX_NO_DOC_STRINGS",
-        "-DONNX_USE_LITE_PROTO=1",
-        "-DORT_ENABLE_STREAM",
-        "-DORT_NO_RTTI",
-        "-DPLATFORM_POSIX",
-        "-fno-sanitize=undefined",
-        "-DGOOGLE_PROTOBUF_NO_RTTI=1",
-        "-w",
-    }) catch @panic("OOM");
-}
+const ort_flags = [_][]const u8{
+    "-std=c++20",
+    "-fno-rtti",
+    "-DCPUINFO_SUPPORTED",
+    "-DCPUINFO_SUPPORTED_PLATFORM=1",
+    "-DEIGEN_MPL2_ONLY",
+    "-DEIGEN_USE_THREADS",
+    "-DENABLE_CPU_FP16_TRAINING_OPS",
+    "-D_GNU_SOURCE",
+    "-DONLY_C_LOCALE=0",
+    "-DONNX_ML=1",
+    "-DONNX_NAMESPACE=onnx",
+    "-D__ONNX_NO_DOC_STRINGS",
+    "-DONNX_USE_LITE_PROTO=1",
+    "-DORT_ENABLE_STREAM",
+    "-DORT_NO_RTTI",
+    "-DPLATFORM_POSIX",
+    "-fno-sanitize=undefined",
+    "-DGOOGLE_PROTOBUF_NO_RTTI=1",
+    "-w",
+};
 
-fn ortCFlags(b: *std.Build) []const []const u8 {
-    return b.allocator.dupe([]const u8, &.{
-        "-std=c11",
-        "-fno-sanitize=undefined",
-        "-DCPUINFO_LOG_LEVEL=2",
-        "-DCPUINFO_LOG_TO_STDIO=1",
-        "-DCPUINFO_SUPPORTED",
-        "-DCPUINFO_SUPPORTED_PLATFORM=1",
-        "-D_GNU_SOURCE",
-        "-w",
-    }) catch @panic("OOM");
-}
+const ort_c_flags = [_][]const u8{
+    "-std=c11",
+    "-fno-sanitize=undefined",
+    "-DCPUINFO_LOG_LEVEL=2",
+    "-DCPUINFO_LOG_TO_STDIO=1",
+    "-DCPUINFO_SUPPORTED",
+    "-DCPUINFO_SUPPORTED_PLATFORM=1",
+    "-D_GNU_SOURCE",
+    "-w",
+};
+
+/// Applied to every mlas ISA group, on top of `ort_flags`.
+const mlas_group_flags = [_][]const u8{
+    "-fvisibility=hidden",
+    "-fvisibility-inlines-hidden",
+};
 
 const ort_config_header =
     \\#pragma once
@@ -260,15 +263,6 @@ const ort_config_header =
     \\#define HAS_UNUSED_BUT_SET_VARIABLE
     \\#define HAS_UNUSED_VARIABLE
     \\#define ORT_BUILD_INFO "ORT Build Info: built by build.zig"
-    \\#define ORT_VERSION "1.29.0"
-    \\
-;
-
-const ort_cpu_features2 =
-    \\/* cpuid_info.cc probes waitpkg through __builtin_cpu_supports, which reads a
-    \\   table that gcc keeps in libgcc. Zig's compiler_rt carries __cpu_model but not
-    \\   __cpu_features2, so define it here and leave it zeroed: onnxruntime then sees
-    \\   no TPAUSE and spins the way it does on any cpu without the instruction. */
-    \\unsigned int __cpu_features2[8];
+    \\#define ORT_VERSION "{s}"
     \\
 ;
