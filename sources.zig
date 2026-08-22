@@ -1195,3 +1195,51 @@ pub const ort_mlas_groups = [_]MlasGroup{
         },
     },
 };
+
+// The OpenVINO execution provider, ORT's only route to an Intel NPU. These
+// go into a shared library of their own rather than into libonnxruntime.a:
+// ORT reaches an OpenVINO EP by dlopening it and calling CreateEpFactories,
+// and the .so in turn calls back into the runtime through the one symbol
+// Provider_GetHost. See `openvinoProvider` in build.zig.
+pub const ort_openvino_sources = [_][]const u8{
+    "core/providers/openvino/backend_manager.cc",
+    "core/providers/openvino/backend_utils.cc",
+    "core/providers/openvino/backends/backend_factory.cc",
+    "core/providers/openvino/backends/basic_backend.cc",
+    "core/providers/openvino/onnx_ctx_model_helper.cc",
+    "core/providers/openvino/openvino_execution_provider.cc",
+    "core/providers/openvino/openvino_parser_utils.cc",
+    "core/providers/openvino/openvino_provider_dllmain.cc",
+    "core/providers/openvino/openvino_provider_factory.cc",
+    "core/providers/openvino/ov_allocator.cc",
+    "core/providers/openvino/ov_bin_manager.cc",
+    "core/providers/openvino/ov_factory.cc",
+    "core/providers/openvino/ov_interface.cc",
+    "core/providers/openvino/ov_protobuf_utils.cpp",
+    "core/providers/openvino/ov_shared_context.cc",
+    "core/providers/openvino/ov_stateful_patch_utils.cc",
+    "core/providers/openvino/ov_tracing.cc",
+    "core/providers/openvino/ov_versions/capability.cc",
+    "core/providers/openvino/ov_versions/data_ops.cc",
+    "core/providers/openvino/ov_versions/utils.cc",
+    "core/providers/openvino/qdq_transformations/qdq_scales_fix.cc",
+    "core/providers/openvino/qdq_transformations/qdq_stripping.cc",
+};
+
+// The provider side of the bridge: re-implements the runtime's internal C++
+// types (Node, GraphViewer, Tensor, ...) as forwarders onto the ProviderHost
+// vtable that Provider_GetHost hands back. Compiled into every provider .so,
+// never into the runtime itself.
+pub const ort_provider_shared_sources = [_][]const u8{
+    "core/providers/shared_library/provider_bridge_provider.cc",
+    "core/providers/shared_library/provider_ort_api_init.cc",
+};
+
+// The mailbox the two halves of the bridge meet in: one global ProviderHost
+// pointer, a setter and a getter. Upstream builds it as its own tiny shared
+// library, and so does build.zig, because that is what makes the pointer a
+// single object -- the runtime dlopens it and calls Provider_SetHost, every
+// provider .so links it and calls Provider_GetHost.
+pub const ort_provider_host_sources = [_][]const u8{
+    "core/providers/shared/common.cc",
+};
