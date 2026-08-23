@@ -6,6 +6,7 @@
     .paths = .{
         "build.zig",
         "build.zig.zon",
+        "onnx.zig",
         "sources.zig",
         "tools",
         "README.md",
@@ -62,6 +63,16 @@
         .ort_eigen = .{
             .url = "https://gitlab.com/libeigen/eigen/-/archive/1d8b82b0740839c0de7f1242a3585e3390ff5f33/eigen-1d8b82b0740839c0de7f1242a3585e3390ff5f33.tar.gz",
             .hash = "N-V-__8AAN2YAQHtb4uGS3lW6pQGY_b87n6uwg1_SoL9slvT",
+        },
+        .cudnn_frontend = .{
+            .url = "https://github.com/NVIDIA/cudnn-frontend/archive/refs/tags/v1.24.0.zip",
+            .hash = "N-V-__8AALb4EgG6JJtC91ATZ0SHEIPp6WtWIWjBdFHhXCco",
+            .lazy = true,
+        },
+        .cutlass = .{
+            .url = "https://github.com/NVIDIA/cutlass/archive/refs/tags/v4.4.2.zip",
+            .hash = "N-V-__8AAIktFAktaKa_djoVbsl8VAZiAqzuNLM3bypMtwRo",
+            .lazy = true,
         },
     },
 }

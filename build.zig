@@ -16,8 +16,10 @@
 //! "onnxruntime_c_api.h" then works with no include path of your own.
 //!
 //! `-Dopenvino=<prefix>` additionally builds the OpenVINO execution provider,
-//! which is how ONNX Runtime reaches an Intel NPU. That build links a system
-//! OpenVINO and so gives up the properties above; see `OpenVino`.
+//! which is how ONNX Runtime reaches an Intel NPU, and `-Dcuda=<prefix>` builds
+//! the CUDA one, which is how it reaches an NVIDIA GPU. Each links a system
+//! library -- and CUDA additionally needs nvcc, since nothing else emits device
+//! code -- so either gives up the properties above; see `OpenVino` and `Cuda`.
 
 const std = @import("std");
 const sources = @import("sources.zig");
@@ -28,15 +30,34 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const fetch = fetchStep(b);
 
-    const parts = Parts.init(b, target, optimize, OpenVino.option(b, target, fetch));
-    b.installArtifact(parts.runtime());
-    if (parts.openvino != null) {
-        // Built once and passed along: the provider has to link the very
-        // library that gets installed, or the ProviderHost pointer they are
-        // supposed to share would sit in two different objects.
+    const parts = Parts.init(b, target, optimize, OpenVino.option(b, target, fetch), Cuda.option(b, target));
+    const lib = parts.runtime();
+    b.installArtifact(lib);
+
+    // The Zig side of the package: `onnx.zig` over the library just built.
+    // Linking the artifact into the module is what carries the C headers along,
+    // so the `@cInclude` at the top of onnx.zig resolves, and what makes a
+    // consumer that imports this module link the runtime without asking.
+    const mod = b.addModule("onnxruntime", .{
+        .root_source_file = b.path("onnx.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    mod.linkLibrary(lib);
+    // A provider build runs on GCC's libstdc++, and Zig does not carry a static
+    // archive's own link objects across to whoever links it. Putting them on
+    // the module means they reach every executable that imports it.
+    parts.linkCxx(mod);
+
+    if (parts.openvino != null or parts.cuda != null) {
+        // Built once and passed along: a provider has to link the very library
+        // that gets installed, or the ProviderHost pointer they are supposed to
+        // share would sit in two different objects. One `shared` serves both
+        // providers for the same reason.
         const shared = parts.providersShared();
         b.installArtifact(shared);
-        b.installArtifact(parts.openvinoProvider(shared));
+        if (parts.openvino != null) b.installArtifact(parts.openvinoProvider(shared));
+        if (parts.cuda != null) b.installArtifact(parts.cudaProvider(shared));
     }
 }
 
@@ -47,23 +68,261 @@ pub fn library(
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
 ) *std.Build.Step.Compile {
-    return Parts.init(b, target, optimize, null).runtime();
+    return Parts.init(b, target, optimize, null, null).runtime();
 }
 
-/// Put the C++ standard library a `-Dopenvino` build was compiled against on
-/// a consuming module's link line.
+/// Which execution provider a build ended up carrying.
+pub const Provider = enum {
+    /// None beyond the CPU one compiled into the runtime, and so nothing to
+    /// install and no system library behind it.
+    none,
+    openvino,
+    cuda,
+
+    /// The artifact's name, which is also the file name once installed.
+    fn artifactName(self: Provider) []const u8 {
+        return switch (self) {
+            .none => unreachable,
+            .openvino => "onnxruntime_providers_openvino",
+            .cuda => "onnxruntime_providers_cuda",
+        };
+    }
+};
+
+/// What `select` hands back: the dependency, which provider it carries, and the
+/// few things a consumer has to do differently because of that choice.
 ///
-/// Needed because that build runs on the host's libstdc++ rather than Zig's
-/// libc++, and Zig does not carry a static library's own link objects across
-/// to whoever links it -- so without this the final link ends in undefined
+/// The point of it is that those differences are this package's business, not
+/// its consumers'. Which C++ standard library the build runs on, whether the
+/// executable has to export its dynamic symbols, where `providers_shared` is
+/// installed and why -- all of it follows from how the provider is built, and
+/// none of it is knowable from outside without repeating the reasoning.
+pub const Selection = struct {
+    b: *std.Build,
+    dependency: *std.Build.Dependency,
+    provider: Provider,
+    /// The compiler whose libstdc++ this build runs on, or null when it runs on
+    /// Zig's own libc++ and needs nothing added.
+    cxx: ?[]const u8,
+    /// Set when the OpenVINO behind this was downloaded rather than named, and
+    /// so sits in the build cache with its own oneTBB beside it, neither of
+    /// which is anywhere the dynamic loader looks. See `runtimeLibraryPaths`.
+    fetched_openvino: bool = false,
+
+    /// Directories a program built against this has to have on its library path
+    /// at run time, beyond what the system already provides. Empty unless the
+    /// OpenVINO was downloaded: an installed one is the system's problem, and
+    /// the CUDA provider carries an rpath to its toolkit.
+    pub fn runtimeLibraryPaths(self: Selection) []const []const u8 {
+        return if (self.fetched_openvino) openvinoRuntimeLibraryPaths(self.b) else &.{};
+    }
+
+    /// The Zig module wrapping the C API -- `onnx.zig`, with the runtime it
+    /// calls into already on its link line.
+    pub fn module(self: Selection) *std.Build.Module {
+        return self.dependency.module("onnxruntime");
+    }
+
+    /// Add that module to `mod`'s imports, under the name "onnxruntime".
+    /// Linking the runtime comes with it, since the module carries it.
+    pub fn addImport(self: Selection, mod: *std.Build.Module) void {
+        mod.addImport("onnxruntime", self.module());
+    }
+
+    /// What an executable needs beyond `link`.
+    ///
+    /// The standard library again, because Zig does not carry a static
+    /// archive's own link objects across to whoever links it. And, for CUDA,
+    /// `rdynamic`: some of its kernels subclass their CPU counterparts, so the
+    /// provider is dlopened with an undefined reference to
+    /// `onnxruntime::Einsum::DeviceCompute` still outstanding. Upstream ships
+    /// the runtime as a shared library and that resolves against it; here the
+    /// runtime is a static archive inside the executable, and an executable
+    /// exports nothing to the libraries it loads unless it is asked to.
+    pub fn linkExecutable(self: Selection, exe: *std.Build.Step.Compile) void {
+        if (self.cxx) |cxx| linkStdCxx(self.b, exe.root_module, cxx);
+        if (self.provider == .cuda) exe.rdynamic = true;
+    }
+
+    /// Install the provider library and the bridge that reaches it, and answer
+    /// with the path the provider landed at -- which is what the program has to
+    /// be told, since the runtime dlopens it by path. Empty for `.none`.
+    ///
+    /// `libonnxruntime_providers_shared.so` goes to `.bin` rather than the
+    /// usual `.lib` because the runtime dlopens it *by name*, out of the
+    /// directory the running binary sits in.
+    pub fn installProvider(self: Selection) []const u8 {
+        const b = self.b;
+        if (self.provider == .none) return "";
+
+        b.getInstallStep().dependOn(&b.addInstallArtifact(
+            self.dependency.artifact("onnxruntime_providers_shared"),
+            .{ .dest_dir = .{ .override = .bin } },
+        ).step);
+
+        const name = self.provider.artifactName();
+        const install = b.addInstallArtifact(self.dependency.artifact(name), .{});
+        b.getInstallStep().dependOn(&install.step);
+        return b.getInstallPath(.lib, b.fmt("lib{s}.so", .{name}));
+    }
+};
+
+/// Declare this package's provider options on `b`, resolve the dependency they
+/// select, and return it along with what the choice implies.
+///
+/// A consumer that wants an execution provider should reach for this rather
+/// than `b.dependency` directly: the options, their defaults and their help
+/// text are declared once, here, instead of being restated by every build that
+/// forwards them -- where they would drift.
+pub fn select(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    fallback: Provider,
+) Selection {
+    // Declared here rather than resolved through `OpenVino.option`, which is
+    // what this package's own build() calls. That returns a struct already
+    // worked out against the machine -- and, for a fetched OpenVINO, a download
+    // step belonging to whichever builder asked for it. A consumer is
+    // forwarding, so what it wants is the options as they were typed.
+    //
+    // All seven asked for before any is read: an option only shows up in `zig
+    // build --help`, and only becomes settable, once b.option has been reached.
+    const openvino = b.option(
+        []const u8,
+        "openvino",
+        "Prefix of a system OpenVINO (2026.0+) to build the execution provider against, for Intel NPU and GPU support",
+    );
+    const openvino_include = b.option(
+        []const u8,
+        "openvino-include",
+        "Include directory of the OpenVINO headers, if not <prefix>/include",
+    );
+    const openvino_lib = b.option(
+        []const u8,
+        "openvino-lib",
+        "Directory holding libopenvino.so and the plugins, if not <prefix>/lib",
+    );
+    const cuda = b.option(
+        []const u8,
+        "cuda",
+        "Prefix of a CUDA toolkit (12.x) to build the execution provider against, for NVIDIA GPU support",
+    );
+    const cudnn_include = b.option(
+        []const u8,
+        "cudnn-include",
+        "Directory holding cudnn.h, if not <cuda prefix>/include",
+    );
+    const cuda_arch = b.option(
+        []const u8,
+        "cuda-arch",
+        "Compute capability to emit device code for (default: 89, Ada -- RTX 40 series)",
+    );
+    const cuda_ccbin = b.option(
+        []const u8,
+        "cuda-ccbin",
+        "Host C++ compiler for nvcc to drive, if the default c++ is newer than the toolkit accepts",
+    );
+
+    // One runtime takes one provider library. Two would need two of everything
+    // in `Selection` -- and the device asked for would stop naming one of them.
+    if (openvino != null and cuda != null) {
+        std.log.err("-Dopenvino and -Dcuda cannot be combined: pick the one device to build for", .{});
+        std.process.exit(1);
+    }
+
+    // Naming a prefix is always honoured. Otherwise `fallback` decides, which
+    // is how a consumer's own device option reaches down here: asking for a
+    // device the CPU provider cannot serve is what calls for a provider.
+    const provider: Provider = if (openvino != null)
+        .openvino
+    else if (cuda != null)
+        .cuda
+    else
+        fallback;
+
+    switch (provider) {
+        .none => return .{
+            .b = b,
+            .dependency = b.dependency("onnxruntime", .{ .target = target, .optimize = optimize }),
+            .provider = .none,
+            .cxx = null,
+        },
+
+        .openvino => return .{
+            .b = b,
+            // With no prefix named there is nothing installed to build
+            // against, so the package downloads Intel's release instead.
+            // -Dopenvino-include and -Dopenvino-lib are for describing an
+            // installed one whose layout is unusual -- a split-output package
+            // manager, say -- so they ride along with the prefix and not with
+            // the download, whose layout the package already knows.
+            .dependency = if (openvino) |prefix| b.dependency("onnxruntime", .{
+                .target = target,
+                .optimize = optimize,
+                .openvino = prefix,
+                .@"openvino-include" = openvino_include orelse b.pathJoin(&.{ prefix, "include" }),
+                .@"openvino-lib" = openvino_lib orelse b.pathJoin(&.{ prefix, "lib" }),
+            }) else b.dependency("onnxruntime", .{
+                .target = target,
+                .optimize = optimize,
+                .@"openvino-fetch" = true,
+            }),
+            .provider = .openvino,
+            .cxx = b.graph.environ_map.get("CXX") orelse "c++",
+            .fetched_openvino = openvino == null,
+        },
+
+        .cuda => {
+            // No equivalent of -Dopenvino-fetch: NVIDIA's toolkit is not a
+            // tarball to unpack beside the build, and nvcc has to come out of a
+            // real installation.
+            const prefix = cuda orelse {
+                std.log.err(
+                    "reaching an NVIDIA GPU needs -Dcuda=<prefix>: there is no toolkit to download, and nvcc is what compiles the provider's device code",
+                    .{},
+                );
+                std.process.exit(1);
+            };
+            const ccbin = cuda_ccbin orelse b.graph.environ_map.get("CXX") orelse "c++";
+            return .{
+                .b = b,
+                .dependency = b.dependency("onnxruntime", .{
+                    .target = target,
+                    .optimize = optimize,
+                    .cuda = prefix,
+                    .@"cudnn-include" = cudnn_include orelse b.pathJoin(&.{ prefix, "include" }),
+                    .@"cuda-arch" = cuda_arch orelse "89",
+                    .@"cuda-ccbin" = ccbin,
+                }),
+                .provider = .cuda,
+                // Whatever nvcc drives, since the .cu objects and the .cc
+                // objects have to agree -- see `Cuda`.
+                .cxx = ccbin,
+            };
+        },
+    }
+}
+
+/// Put the C++ standard library a `-Dopenvino` or `-Dcuda` build was compiled
+/// against on a consuming module's link line.
+///
+/// Needed because those builds run on GCC's libstdc++ rather than Zig's libc++,
+/// and Zig does not carry a static library's own link objects across to whoever
+/// links it -- so without this the final link ends in undefined
 /// `__cxa_begin_catch` and friends. The default build needs nothing of the
 /// sort; its libc++ comes along with the artifact.
 ///
+/// `cxx` names the compiler to take libstdc++ from, and must be the same one
+/// the dependency was configured with -- for a -Dcuda build, whatever was
+/// passed as -Dcuda-ccbin. Null asks the host default, which is right for
+/// -Dopenvino and for a CUDA toolkit new enough to accept it.
+///
 ///     const ort = b.dependency("onnxruntime", .{ ... });
 ///     exe.root_module.linkLibrary(ort.artifact("onnxruntime"));
-///     @import("onnxruntime").linkStdCxx(b, exe.root_module);
-pub fn linkStdCxx(b: *std.Build, mod: *std.Build.Module) void {
-    Gnu.detect(b).link(mod);
+///     @import("onnxruntime").linkStdCxx(b, exe.root_module, null);
+pub fn linkStdCxx(b: *std.Build, mod: *std.Build.Module, cxx: ?[]const u8) void {
+    Gnu.detect(b, cxx orelse b.graph.environ_map.get("CXX") orelse "c++").link(mod);
 }
 
 /// A system OpenVINO to build the execution provider against.
@@ -135,6 +394,95 @@ pub const OpenVino = struct {
             .include = include_option orelse default_include,
             .lib = lib_option orelse default_lib,
             .fetch = fetch_step,
+        };
+    }
+};
+
+/// A CUDA toolkit to build the execution provider against, for an NVIDIA GPU.
+///
+/// Device code cannot come from source the way the rest of this build does:
+/// only NVIDIA's own nvcc emits it, and nvcc drives a *host* compiler for the
+/// C++ half of every `.cu` file. That host compiler is GCC, so -Dcuda pulls the
+/// whole build onto GCC's libstdc++ for exactly the reason `OpenVino` does --
+/// provider and runtime pass each other C++ objects, so one ABI has to win.
+pub const Cuda = struct {
+    /// Prefix holding `bin/nvcc`, `include/cuda_runtime.h` and `lib/libcudart.so`.
+    prefix: []const u8,
+    /// Where `cudnn.h` lives. cuDNN is dlopened by name at run time and never
+    /// linked, so this is headers only -- but the provider will not compile
+    /// without them.
+    cudnn_include: []const u8,
+    /// The compute capability to emit device code for, e.g. "89" for Ada. One
+    /// architecture, not a fat binary: each one compiled costs another pass
+    /// over every kernel, and a build this size is slow enough already.
+    arch: []const u8,
+    /// Host compiler nvcc passes to its `-ccbin` flag. nvcc runs this compiler
+    /// over every host translation unit inside a `.cu` file, so the runtime
+    /// and the other providers have to link whatever libstdc++ it supplies.
+    ccbin: []const u8,
+
+    fn compiler(self: Cuda, b: *std.Build) []const u8 {
+        return b.pathJoin(&.{ self.prefix, "bin", "nvcc" });
+    }
+
+    /// Read the toolkit's version as an integer like `1208` for 12.8, probed
+    /// from nvcc.
+    fn version(self: Cuda, b: *std.Build) u32 {
+        var code: u8 = undefined;
+        const out = b.runAllowFail(&.{ self.compiler(b), "--version" }, &code, .ignore) catch |err| {
+            std.log.err("running `{s} --version`: {s}", .{ self.compiler(b), @errorName(err) });
+            std.process.exit(1);
+        };
+        // nvcc: NVIDIA (R) Cuda compiler driver
+        // Copyright (c) 2005-2024 NVIDIA Corporation
+        // Built on Thu_Sep_12_02:18:05_PDT_2024
+        // Cuda compilation tools, release 12.6, V12.6.77
+        const release_marker = "release ";
+        const pos = std.mem.indexOf(u8, out, release_marker) orelse return 0;
+        const rest = out[pos + release_marker.len ..];
+        var parts = std.mem.splitScalar(u8, rest, '.');
+        const major = std.fmt.parseInt(u32, parts.next() orelse return 0, 10) catch return 0;
+        const minor_str = parts.next() orelse return 0;
+        const comma = std.mem.indexOfScalar(u8, minor_str, ',') orelse minor_str.len;
+        const minor = std.fmt.parseInt(u32, minor_str[0..comma], 10) catch return 0;
+        return major * 100 + minor;
+    }
+
+    fn option(b: *std.Build, target: std.Build.ResolvedTarget) ?Cuda {
+        // All four declared before any is read: an option only shows up in
+        // `zig build --help`, and only becomes settable, once b.option has
+        // been reached.
+        const prefix_option = b.option(
+            []const u8,
+            "cuda",
+            "Prefix of a CUDA toolkit (12.x) to build the execution provider against, for NVIDIA GPU support",
+        );
+        const cudnn_include_option = b.option(
+            []const u8,
+            "cudnn-include",
+            "Directory holding cudnn.h, if not <prefix>/include",
+        );
+        const arch_option = b.option(
+            []const u8,
+            "cuda-arch",
+            "Compute capability to emit device code for (default: 89, Ada -- RTX 40 series)",
+        );
+        const ccbin_option = b.option(
+            []const u8,
+            "cuda-ccbin",
+            "Host C++ compiler for nvcc to drive, if the default c++ is newer than the toolkit accepts",
+        );
+
+        const prefix = prefix_option orelse return null;
+        if (!target.query.isNative()) {
+            std.log.err("-Dcuda builds against the host's libstdc++ and cannot cross-compile", .{});
+            std.process.exit(1);
+        }
+        return .{
+            .prefix = prefix,
+            .cudnn_include = cudnn_include_option orelse b.pathJoin(&.{ prefix, "include" }),
+            .arch = arch_option orelse "89",
+            .ccbin = ccbin_option orelse b.graph.environ_map.get("CXX") orelse "c++",
         };
     }
 };
@@ -228,9 +576,10 @@ const Gnu = struct {
         }
     }
 
-    fn detect(b: *std.Build) Gnu {
-        const cxx = b.graph.environ_map.get("CXX") orelse "c++";
-
+    /// `cxx` is the compiler to interrogate. It matters which: a -Dcuda build
+    /// typically has to be built with a compiler older than the latest one
+    /// the toolkit knows about, so -Dcuda-ccbin usually names an older one.
+    fn detect(b: *std.Build, cxx: []const u8) Gnu {
         // The include search list is printed on stderr, between two markers,
         // hence the redirect: runAllowFail only hands back stdout. Only the
         // C++ directories are wanted -- Zig supplies libc itself.
@@ -274,14 +623,16 @@ const Gnu = struct {
     }
 };
 
-/// The dependencies, include set and generated headers that both the runtime
-/// and the OpenVINO provider are built from. `b.dependency` is memoised, so
+/// The dependencies, include set and generated headers that the runtime and the
+/// execution providers are all built from. `b.dependency` is memoised, so
 /// naming them once here is only about not repeating the list.
 const Parts = struct {
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     openvino: ?OpenVino,
+    cuda: ?Cuda,
+    cxx: []const u8,
     gnu: ?Gnu,
     ort: *std.Build.Dependency,
     protobuf: *std.Build.Dependency,
@@ -299,6 +650,7 @@ const Parts = struct {
         target: std.Build.ResolvedTarget,
         optimize: std.builtin.OptimizeMode,
         openvino: ?OpenVino,
+        cuda: ?Cuda,
     ) Parts {
         const ort = b.dependency("ort_src", .{});
         const protobuf = b.dependency("protobuf", .{});
@@ -341,21 +693,44 @@ const Parts = struct {
             b.dependency("json", .{}).path("single_include"),
         }) catch @panic("OOM");
 
+        const cxx = if (cuda) |c|
+            c.ccbin
+        else
+            b.graph.environ_map.get("CXX") orelse "c++";
+
         // -gline-tables-only: full DWARF for a build this size overruns what
         // Mach-O's debug map can address, and the line tables are all the
         // symbolicated backtraces here need.
         const cxx_base = if (openvino == null) &ort_flags else &ort_openvino_flags;
-        const cxx_flags = if (target.result.os.tag.isDarwin())
+        var cxx_flags = if (target.result.os.tag.isDarwin())
             concatFlags(b, &.{ cxx_base, &.{"-gline-tables-only"} })
         else
             cxx_base;
+
+        if (cuda != null) {
+            // The runtime and the CUDA provider meet over `ProviderHostCPU`, a pure
+            // virtual interface whose *shape* depends on this define: 16 of its
+            // methods sit behind `#if defined(USE_CUDA) ||
+            // defined(USE_CUDA_PROVIDER_INTERFACE)` in cpu_provider_shared.h. The
+            // provider is compiled with USE_CUDA and so sees the long version; the
+            // runtime holds the implementation and, without this, would compile the
+            // short one. Two vtable layouts over one object is not a link error --
+            // every call through it simply arrives at the wrong slot, which shows up
+            // as a jump to a nonsense address the first time a CUDA kernel asks the
+            // CPU provider for anything. Upstream sets it in ORT_PROVIDER_FLAGS for
+            // the same reason. Harmless on the provider, where the `#if` is a
+            // disjunction and USE_CUDA has already satisfied it.
+            cxx_flags = concatFlags(b, &.{ cxx_flags, &.{"-DUSE_CUDA_PROVIDER_INTERFACE=1"} });
+        }
 
         return .{
             .b = b,
             .target = target,
             .optimize = optimize,
             .openvino = openvino,
-            .gnu = if (openvino == null) null else Gnu.detect(b),
+            .cuda = cuda,
+            .cxx = cxx,
+            .gnu = if (openvino == null and cuda == null) null else Gnu.detect(b, cxx),
             .ort = ort,
             .protobuf = protobuf,
             .onnx = onnx,
@@ -396,7 +771,6 @@ const Parts = struct {
     fn linkCxx(self: Parts, mod: *std.Build.Module) void {
         if (self.gnu) |gnu| gnu.link(mod);
     }
-
     fn runtime(self: Parts) *std.Build.Step.Compile {
         const b = self.b;
         const ort_root = self.ort.path("onnxruntime");
@@ -572,6 +946,212 @@ const Parts = struct {
         if (openvino.fetch) |fetch| provider.step.dependOn(&fetch.step);
         return provider;
     }
+
+    /// libonnxruntime_providers_cuda.so.
+    ///
+    /// Same shape as `openvinoProvider` -- a dlopened .so exporting
+    /// GetProvider, CreateEpFactories and ReleaseEpFactory, reaching the
+    /// runtime through `providersShared` -- but built from two halves rather
+    /// than one. The `.cc` files are ordinary C++ and go through Zig like
+    /// everything else here; the `.cu` files hold device code, which only nvcc
+    /// can emit, so each is compiled to an object by `deviceObjects` and handed
+    /// to the linker.
+    ///
+    /// Scope: both operator trees, ONNX and com.microsoft. See
+    /// `sources.ort_cuda_sources` for why the second is not optional.
+    fn cudaProvider(self: Parts, shared: *std.Build.Step.Compile) *std.Build.Step.Compile {
+        const b = self.b;
+        const cuda = self.cuda.?;
+        const ort_root = self.ort.path("onnxruntime");
+
+        const mod = self.cxxModule(self.target);
+        mod.addIncludePath(self.protos);
+        for (self.cudaIncludes()) |include| mod.addIncludePath(include);
+
+        const flags_ = concatFlags(b, &.{ self.flags, &cuda_defines, self.cudaConfigDefines() });
+        mod.addCSourceFiles(.{ .root = ort_root, .files = &sources.ort_cuda_sources, .flags = flags_ });
+        mod.addCSourceFiles(.{ .root = ort_root, .files = &sources.ort_provider_shared_sources, .flags = flags_ });
+
+        // Its own onnx protobuf and abseil, for the reason `openvinoProvider`
+        // gives: the version script hides everything that is not an entry
+        // point, so the runtime's copies and these cannot collide.
+        mod.addCSourceFiles(.{ .root = self.protos, .files = &sources.onnx_proto_sources, .flags = flags_ });
+        mod.addCSourceFiles(.{ .root = self.protobuf.path(""), .files = &sources.protobuf_lite_sources, .flags = flags_ });
+        mod.addCSourceFiles(.{ .root = self.abseil.path(""), .files = &sources.abseil_sources, .flags = flags_ });
+
+        for (self.deviceObjects()) |object| mod.addObjectFile(object);
+
+        mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ cuda.prefix, "lib" }) });
+        mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ cuda.prefix, "lib64" }) });
+        // cuDNN and cuFFT are deliberately absent: the provider dlopens them by
+        // soname when an op needs them (see cudnn_loader.cc), so a machine that
+        // never runs a convolution needs neither installed.
+        for ([_][]const u8{ "cudart", "cublas", "cublasLt", "curand" }) |name| {
+            mod.linkSystemLibrary(name, .{});
+        }
+        // libcuda.so.1 is the driver, not the toolkit. It ships with the
+        // installed NVIDIA driver, in a directory that has nothing to do with
+        // this prefix and differs on every distribution, so the toolkit carries
+        // a stub -- the right symbols over no implementation -- to link against
+        // instead. At run time the loader finds the real one, which is why the
+        // stub directory is deliberately not an RPATH below: resolving there at
+        // run time would find a driver that can do nothing.
+        mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ cuda.prefix, "lib", "stubs" }) });
+        mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ cuda.prefix, "lib64", "stubs" }) });
+        mod.linkSystemLibrary("cuda", .{});
+        mod.addRPath(.{ .cwd_relative = b.pathJoin(&.{ cuda.prefix, "lib" }) });
+        self.linkCxx(mod);
+
+        const provider = b.addLibrary(.{
+            .name = "onnxruntime_providers_cuda",
+            .linkage = .dynamic,
+            .root_module = mod,
+        });
+        provider.setVersionScript(self.ort.path("onnxruntime/core/providers/cuda/version_script.lds"));
+        provider.root_module.linkLibrary(shared);
+        provider.root_module.addRPath(.{ .cwd_relative = "$ORIGIN" });
+        return provider;
+    }
+
+    /// The include directories the CUDA provider needs on top of `includes`:
+    /// the toolkit's own headers, cuDNN's, and the two header-only NVIDIA
+    /// libraries the provider's convolution and attention kernels are written
+    /// against. Both of the latter are lazy dependencies -- they are 200 MB
+    /// between them and no other build here touches either.
+    fn cudaIncludes(self: Parts) []const std.Build.LazyPath {
+        const b = self.b;
+        const cuda = self.cuda.?;
+
+        var list: std.ArrayList(std.Build.LazyPath) = .empty;
+        list.appendSlice(b.allocator, &.{
+            .{ .cwd_relative = b.pathJoin(&.{ cuda.prefix, "include" }) },
+            .{ .cwd_relative = cuda.cudnn_include },
+        }) catch @panic("OOM");
+        if (b.lazyDependency("cudnn_frontend", .{})) |dep| {
+            list.append(b.allocator, dep.path("include")) catch @panic("OOM");
+        }
+        if (b.lazyDependency("cutlass", .{})) |dep| {
+            list.appendSlice(b.allocator, &.{
+                dep.path("include"),
+                // Not a mistake: the fused multi-head attention kernels include
+                // headers out of CUTLASS's example 41, which upstream also puts
+                // on the include path rather than vendoring.
+                dep.path("examples"),
+                dep.path("tools/util/include"),
+            }) catch @panic("OOM");
+        }
+        return list.items;
+    }
+
+    /// The defines that depend on the build, as opposed to the fixed
+    /// `cuda_defines`: what the optimiser was told, and what the target
+    /// architecture can do.
+    fn cudaConfigDefines(self: Parts) []const []const u8 {
+        const b = self.b;
+
+        var list: std.ArrayList([]const u8) = .empty;
+        // NDEBUG is not a nicety here. xqa's kernel_mha_impl is a plain
+        // __device__ function with it and a __global__ kernel without, and the
+        // second form makes nvcc emit a host stub naming a type it cannot spell.
+        // Zig defines this for its own release compiles; nvcc has to be told.
+        if (self.optimize != .Debug) list.appendSlice(b.allocator, &.{ "-O3", "-DNDEBUG" }) catch @panic("OOM");
+
+        // Which SM the kernels may assume. During nvcc's *device* pass the code
+        // reads __CUDA_ARCH__ directly, but on the host pass there is no such
+        // macro, and xqa keys its kernel declarations off these instead. Get it
+        // wrong and the two passes disagree about which kernels exist -- the
+        // device side defines one the host side never declares, and the
+        // generated stub refers to a member of a namespace that has none.
+        const sm = std.fmt.parseInt(u32, self.cuda.?.arch, 10) catch {
+            std.log.err("-Dcuda-arch must be a compute capability such as 89, not '{s}'", .{self.cuda.?.arch});
+            std.process.exit(1);
+        };
+        if (sm >= 80) list.append(b.allocator, "-DHAS_SM80_OR_LATER") catch @panic("OOM");
+        if (sm >= 90) list.append(b.allocator, "-DHAS_SM90_OR_LATER") catch @panic("OOM");
+
+        // Which narrow float types the provider is compiled to know about.
+        // These describe the *types*, not the quantised-MoE kernels that use
+        // them -- those are a separate pair of options, left off, and the
+        // kernels behind them are not in the source lists. Both matter even so:
+        // moe_gemm_kernels.h declares use_wfp4afp8 in the fallback arm of the
+        // FP8 block and again in the fallback arm of the FP4 block, so with
+        // neither type enabled it declares the same member twice.
+        list.appendSlice(b.allocator, &.{ "-DENABLE_BF16", "-DENABLE_FP8" }) catch @panic("OOM");
+        if (self.cuda.?.version(b) >= 1208) list.append(b.allocator, "-DENABLE_FP4") catch @panic("OOM");
+        return list.items;
+    }
+
+    /// One object per `.cu` file, each from its own nvcc run.
+    ///
+    /// A run step per translation unit rather than one nvcc over the lot: it is
+    /// what lets the build system schedule them across cores and skip the ones
+    /// whose inputs have not moved. nvcc is slow enough -- ten seconds and up
+    /// for a kernel of any size -- that both matter.
+    fn deviceObjects(self: Parts) []const std.Build.LazyPath {
+        const b = self.b;
+        const cuda = self.cuda.?;
+
+        const arch = b.fmt("-gencode=arch=compute_{s},code=sm_{s}", .{ cuda.arch, cuda.arch });
+        var objects: std.ArrayList(std.Build.LazyPath) = .empty;
+        for (sources.ort_cuda_device_sources) |file| {
+            const run = b.addSystemCommand(&.{ cuda.compiler(b), "-ccbin", cuda.ccbin });
+            run.addArgs(&.{ "-std=c++20", "-c", arch });
+            run.addArgs(&nvcc_flags);
+            run.addArgs(&cuda_defines);
+            run.addArgs(self.cudaConfigDefines());
+            // The .cu objects land in a shared library beside the .cc ones, so
+            // the host half of each has to be built the same way.
+            run.addArgs(&.{ "-Xcompiler", "-fPIC" });
+
+            for (self.includes) |include| run.addPrefixedDirectoryArg("-I", include);
+            run.addPrefixedDirectoryArg("-I", self.protos);
+            for (self.cudaIncludes()) |include| run.addPrefixedDirectoryArg("-I", include);
+
+            run.addFileArg(self.ort.path(b.fmt("onnxruntime/{s}", .{file})));
+            run.addArg("-o");
+            objects.append(
+                b.allocator,
+                run.addOutputFileArg(b.fmt("{s}.o", .{std.fs.path.basename(file)})),
+            ) catch @panic("OOM");
+        }
+        return objects.items;
+    }
+};
+
+/// Defines shared by both halves of the CUDA provider.
+const cuda_defines = [_][]const u8{
+    "-DUSE_CUDA=1",
+    // Both on, as upstream has them by default for a CUDA build. They gate the
+    // two attention backends the ONNX-domain Attention kernel is written
+    // against, and the sources behind them are in `ort_cuda_device_sources`.
+    "-DUSE_FLASH_ATTENTION=1",
+    "-DUSE_MEMORY_EFFICIENT_ATTENTION=1",
+    // cudnn_frontend resolves cuDNN's entry points with dlsym rather than
+    // linking them, which is what lets the provider load on a machine that has
+    // no cuDNN until something asks for a convolution.
+    "-DNV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING",
+};
+
+/// nvcc's own switches, as opposed to the preprocessor defines above.
+const nvcc_flags = [_][]const u8{
+    // ORT calls plenty of constexpr host functions from device code and relies
+    // on nvcc allowing it.
+    "--expt-relaxed-constexpr",
+    "--expt-extended-lambda",
+    // CUDA 12.8 turned several long-standing patterns in this tree into
+    // diagnostics: 177 unused variable in CUTLASS, 221 and 550 from the CUDA
+    // and flatbuffers headers, 2810 a false positive on assigning a
+    // [[nodiscard]] Status, 2908 deprecated by-copy `this` capture in CUTLASS.
+    // 68, 69 and 554 are abseil's and GSL's, and predate that.
+    "--diag-suppress=68,69,177,221,554,2810,2908",
+    "-Xcudafe",
+    "--diag_suppress=550",
+    // Since 12.8 nvcc emits a definition for every global template stub it
+    // sees, which multiply-defines the ones ORT instantiates in more than one
+    // translation unit.
+    "--static-global-template-stub=false",
+    "-Xcompiler",
+    "-Wno-reorder",
 };
 
 fn buildProtoc(b: *std.Build, protobuf: *std.Build.Dependency) *std.Build.Step.Compile {
