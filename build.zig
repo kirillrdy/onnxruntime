@@ -83,9 +83,12 @@ pub const OpenVino = struct {
     /// Defaults to `<prefix>/lib`; Intel's own archives put all of it in
     /// `runtime/lib/intel64`, which no prefix describes.
     lib: []const u8,
+    /// The download this was unpacked from, for the provider to wait on, or
+    /// null when an installed OpenVINO was named and there is nothing to fetch.
+    fetch: ?*std.Build.Step.Run,
 
     fn option(b: *std.Build, target: std.Build.ResolvedTarget) ?OpenVino {
-        // All three declared before any is read: an option only shows up in
+        // All four declared before any is read: an option only shows up in
         // `zig build --help`, and only becomes settable, once b.option has
         // been reached, so returning early would hide the rest.
         const prefix_option = b.option(
@@ -103,20 +106,108 @@ pub const OpenVino = struct {
             "openvino-lib",
             "Directory holding libopenvino.so and the plugins, if not <prefix>/lib",
         );
+        const fetch_option = b.option(
+            bool,
+            "openvino-fetch",
+            "Build against the OpenVINO release `fetch-openvino` downloads, rather than one installed on the machine",
+        ) orelse false;
 
-        const prefix = prefix_option orelse return null;
-        const include = include_option orelse b.pathJoin(&.{ prefix, "include" });
-        const lib = lib_option orelse b.pathJoin(&.{ prefix, "lib" });
+        if (prefix_option == null and !fetch_option) return null;
+        if (prefix_option != null and fetch_option) {
+            std.log.err("-Dopenvino names an installed OpenVINO and -Dopenvino-fetch downloads one; pass one or the other", .{});
+            std.process.exit(1);
+        }
 
         // The libstdc++ this drags in is the host's, found by asking the host
         // compiler. Handing those headers to a cross build would be nonsense.
         if (!target.query.isNative()) {
-            std.log.err("-Dopenvino builds against the host's libstdc++ and cannot cross-compile", .{});
+            std.log.err("an OpenVINO build runs on the host's libstdc++ and cannot cross-compile", .{});
             std.process.exit(1);
         }
-        return .{ .include = include, .lib = lib };
+
+        if (prefix_option) |prefix| return .{
+            .include = include_option orelse b.pathJoin(&.{ prefix, "include" }),
+            .lib = lib_option orelse b.pathJoin(&.{ prefix, "lib" }),
+            .fetch = null,
+        };
+
+        // Intel's layout, which is not a prefix: the libraries and every plugin
+        // sit together in `runtime/lib/intel64`, so both directories are named
+        // outright rather than derived. `-Dopenvino-include` and
+        // `-Dopenvino-lib` still win, for pointing at a hand-unpacked copy.
+        const root = openvinoRoot(b);
+        return .{
+            .include = include_option orelse b.pathJoin(&.{ root, "runtime", "include" }),
+            .lib = lib_option orelse b.pathJoin(&.{ root, "runtime", "lib", "intel64" }),
+            .fetch = fetchStep(b),
+        };
     }
 };
+
+/// The OpenVINO release `fetch-openvino` downloads.
+///
+/// Pinned to a build rather than a version: Intel's archive names itself by
+/// commit, and the NPU compiler inside it is what decides whether a graph
+/// compiles at all, so "2026.3" on its own is not a thing to depend on. The
+/// checksum is the one Intel publishes beside the archive.
+const openvino_version = "2026.3.0";
+const openvino_build = "22451.bd8d6542e3c";
+const openvino_archive = "openvino_toolkit_ubuntu24_" ++ openvino_version ++ "." ++ openvino_build ++ "_x86_64.tgz";
+const openvino_url = "https://storage.openvinotoolkit.org/repositories/openvino/packages/2026.3/linux/" ++ openvino_archive;
+const openvino_sha256 = "0fa43c270bb6bc17bcf8c2c5fc5aa4595377292d54ef38084d8a0390daf4af98";
+
+/// Where the archive is unpacked: the *consumer's* build cache, since a
+/// dependency inherits its parent's `cache_root`. So one copy is shared by
+/// every configuration of a project, and `zig build --clean` reaches it.
+fn openvinoRoot(b: *std.Build) []const u8 {
+    return b.cache_root.join(b.allocator, &.{ "onnxruntime", "openvino" }) catch @panic("OOM");
+}
+
+/// Directories a program built against the downloaded OpenVINO has to have on
+/// its library path at run time.
+///
+/// The provider carries an rpath to the library directory, but `libopenvino.so`
+/// itself carries none, and it links oneTBB -- which is in the archive, in a
+/// directory of its own, and not anywhere the dynamic loader looks. Naming both
+/// here rather than only oneTBB keeps this true of a program run from any
+/// working directory.
+pub fn openvinoRuntimeLibraryPaths(b: *std.Build) []const []const u8 {
+    const root = openvinoRoot(b);
+    return b.allocator.dupe([]const u8, &.{
+        b.pathJoin(&.{ root, "runtime", "lib", "intel64" }),
+        b.pathJoin(&.{ root, "runtime", "3rdparty", "tbb", "lib" }),
+    }) catch @panic("OOM");
+}
+
+/// `zig build fetch-openvino`, and the step the provider hangs off.
+///
+/// `b.dependency` is memoised but this is not, so it is called once, from
+/// `OpenVino.option`, and the result carried in the struct.
+fn fetchStep(b: *std.Build) *std.Build.Step.Run {
+    const fetch_exe = b.addExecutable(.{
+        .name = "fetch",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/fetch.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+
+    const archive = b.cache_root.join(b.allocator, &.{ "onnxruntime", openvino_archive }) catch @panic("OOM");
+    const run = b.addRunArtifact(fetch_exe);
+    run.has_side_effects = true;
+    run.addArgs(&.{
+        "--url",           openvino_url,
+        "--out",           archive,
+        "--sha256",        openvino_sha256,
+        "--extract",       openvinoRoot(b),
+        "--label",         "OpenVINO " ++ openvino_version ++ " (111 MiB)",
+    });
+
+    const step = b.step("fetch-openvino", "Download Intel's OpenVINO release, for -Dopenvino-fetch");
+    step.dependOn(&run.step);
+    return run;
+}
 
 /// Which C++ standard library the whole build runs on. Not a per-module
 /// choice: every object here ends up in one process exchanging std::string
@@ -511,6 +602,10 @@ const Parts = struct {
         // $ORIGIN covers the case where it is not: the two are installed
         // side by side.
         provider.root_module.addRPath(.{ .cwd_relative = "$ORIGIN" });
+        // A downloaded OpenVINO is not on disk until its step has run, and the
+        // headers above are inside it -- so the compile waits on the download
+        // rather than the install.
+        if (openvino.fetch) |fetch| provider.step.dependOn(&fetch.step);
         return provider;
     }
 };
