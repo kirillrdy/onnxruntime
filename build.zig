@@ -387,7 +387,11 @@ const Parts = struct {
 
     /// Flags for every C++ translation unit in the build.
     fn flags(self: Parts) []const []const u8 {
-        return if (self.openvino == null) &ort_flags else &ort_openvino_flags;
+        const base = if (self.openvino == null) &ort_flags else &ort_openvino_flags;
+        if (self.target.result.os.tag.isDarwin()) {
+            return concatFlags(self.b, &.{ base, &.{"-gline-tables-only"} });
+        }
+        return base;
     }
 
     fn runtime(self: Parts) *std.Build.Step.Compile {
@@ -407,7 +411,9 @@ const Parts = struct {
         lib_mod.addCSourceFiles(.{ .root = self.abseil.path(""), .files = &sources.abseil_sources, .flags = ort_flags_ });
         lib_mod.addCSourceFiles(.{ .root = self.re2.path(""), .files = &sources.re2_sources, .flags = ort_flags_ });
         lib_mod.addCSourceFiles(.{ .root = self.protobuf.path(""), .files = &sources.protobuf_lite_sources, .flags = ort_flags_ });
-        lib_mod.addCSourceFiles(.{ .root = self.cpuinfo.path(""), .files = &sources.cpuinfo_sources, .flags = &ort_c_flags });
+        for (sources.cpuinfoSources(self.target.result)) |list| {
+            lib_mod.addCSourceFiles(.{ .root = self.cpuinfo.path(""), .files = list, .flags = &ort_c_flags });
+        }
         lib_mod.addCSourceFiles(.{
             .root = self.ort.path("model_package"),
             .files = &sources.model_package_sources,
@@ -425,10 +431,16 @@ const Parts = struct {
             &sources.ort_lora_sources,
             &sources.ort_flatbuffers_sources,
             &sources.ort_mlas_sources,
+            sources.ortMlasArchSources(self.target.result.cpu.arch),
         }) |list| {
             lib_mod.addCSourceFiles(.{ .root = ort_root, .files = list, .flags = ort_flags_ });
         }
-        for (sources.ort_file_flags) |override| {
+        lib_mod.addCSourceFiles(.{
+            .root = ort_root,
+            .files = &.{sources.platformDeviceDiscoverySource(self.target.result)},
+            .flags = ort_flags_,
+        });
+        for (sources.ortFileFlags(self.target.result)) |override| {
             lib_mod.addCSourceFiles(.{
                 .root = ort_root,
                 .files = &.{override.file},
@@ -442,9 +454,9 @@ const Parts = struct {
             .root_module = lib_mod,
         });
 
-        for (sources.ort_mlas_groups, 0..) |group, index| {
+        for (sources.ortMlasGroups(self.target.result.cpu.arch), 0..) |group, index| {
             var query = self.target.query;
-            for (group.features) |feature| query.cpu_features_add.addFeature(@intFromEnum(feature));
+            for (group.features) |feature| query.cpu_features_add.addFeature(@intCast(feature));
 
             const group_mod = self.cxxModule(b.resolveTargetQuery(query));
             group_mod.addCSourceFiles(.{
