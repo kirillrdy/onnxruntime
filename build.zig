@@ -74,17 +74,20 @@ pub fn linkStdCxx(b: *std.Build, mod: *std.Build.Module) void {
 /// objects across the dlopen boundary, the *whole* build has to match
 /// OpenVINO's ABI -- GCC's libstdc++, with RTTI on, for the host only.
 pub const OpenVino = struct {
-    /// Prefix holding `lib/libopenvino.so` and `lib/openvino/` (the plugins,
-    /// including the NPU plugin and Intel's NPU compiler).
-    prefix: []const u8,
-    /// Where `openvino/openvino.hpp` lives. Package managers that split a
-    /// build into `dev` and `lib` outputs need this pointed at the former.
+    /// Where `openvino/openvino.hpp` lives. Defaults to `<prefix>/include`;
+    /// package managers that split a build into `dev` and `lib` outputs need
+    /// this pointed at the former.
     include: []const u8,
+    /// Where `libopenvino.so` lives, along with `openvino/` or the plugins
+    /// themselves -- the NPU plugin and Intel's NPU compiler among them.
+    /// Defaults to `<prefix>/lib`; Intel's own archives put all of it in
+    /// `runtime/lib/intel64`, which no prefix describes.
+    lib: []const u8,
 
     fn option(b: *std.Build, target: std.Build.ResolvedTarget) ?OpenVino {
-        // Both declared before either is read: an option only shows up in
+        // All three declared before any is read: an option only shows up in
         // `zig build --help`, and only becomes settable, once b.option has
-        // been reached, so returning early would hide the second one.
+        // been reached, so returning early would hide the rest.
         const prefix_option = b.option(
             []const u8,
             "openvino",
@@ -95,9 +98,15 @@ pub const OpenVino = struct {
             "openvino-include",
             "Include directory of the OpenVINO headers, if not <prefix>/include",
         );
+        const lib_option = b.option(
+            []const u8,
+            "openvino-lib",
+            "Directory holding libopenvino.so and the plugins, if not <prefix>/lib",
+        );
 
         const prefix = prefix_option orelse return null;
         const include = include_option orelse b.pathJoin(&.{ prefix, "include" });
+        const lib = lib_option orelse b.pathJoin(&.{ prefix, "lib" });
 
         // The libstdc++ this drags in is the host's, found by asking the host
         // compiler. Handing those headers to a cross build would be nonsense.
@@ -105,7 +114,7 @@ pub const OpenVino = struct {
             std.log.err("-Dopenvino builds against the host's libstdc++ and cannot cross-compile", .{});
             std.process.exit(1);
         }
-        return .{ .prefix = prefix, .include = include };
+        return .{ .include = include, .lib = lib };
     }
 };
 
@@ -481,11 +490,11 @@ const Parts = struct {
         mod.addCSourceFiles(.{ .root = self.protobuf, .files = &sources.protobuf_lite_sources, .flags = flags_ });
         mod.addCSourceFiles(.{ .root = self.abseil, .files = &sources.abseil_sources, .flags = flags_ });
 
-        mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ openvino.prefix, "lib" }) });
+        mod.addLibraryPath(.{ .cwd_relative = openvino.lib });
         mod.linkSystemLibrary("openvino", .{});
         // Loaded at run time from where it was linked, so the plugins beside
         // it -- the NPU plugin, and Intel's NPU compiler -- are found too.
-        mod.addRPath(.{ .cwd_relative = b.pathJoin(&.{ openvino.prefix, "lib" }) });
+        mod.addRPath(.{ .cwd_relative = openvino.lib });
         self.linkCxx(mod);
 
         const provider = b.addLibrary(.{

@@ -111,8 +111,12 @@ g->SessionOptionsAppendExecutionProvider_V2(opts, env, &npu, 1, NULL, NULL, 0);
 
 That enumerates the iGPU too, so the same flag gets you `GPU` as well as `NPU`.
 
-`-Dopenvino-include=<dir>` points at the headers separately, for package
-managers that split a build into `dev` and `lib` outputs.
+`-Dopenvino-include=<dir>` and `-Dopenvino-lib=<dir>` point at the headers and
+at `libopenvino.so` separately, overriding `<prefix>/include` and
+`<prefix>/lib`. The first is for package managers that split a build into
+`dev` and `lib` outputs; the second is for Intel's own archives, which put the
+libraries and the plugins together in `runtime/lib/intel64` — a layout no
+prefix describes.
 
 ### What it costs
 
@@ -132,9 +136,9 @@ changes.
 
 OpenVINO 2026.0 or newer — the version ONNX Runtime 1.29 requires — with the
 NPU plugin and Intel's NPU compiler (`libopenvino_intel_npu_compiler.so`)
-present in `<prefix>/lib/openvino/`. Some distributions package the plugin
-without the compiler, in which case compiling for the NPU fails with `VCL
-compiler loading failed`.
+present alongside the plugins. Some distributions package the plugin without
+the compiler, in which case compiling for the NPU fails with `VCL compiler
+loading failed`; Intel's own archives carry both.
 
 At run time the NPU plugin needs the Level Zero loader (`libze_loader.so.1`)
 and the NPU driver (`libze_intel_npu.so.1`) on the library path. If only the
