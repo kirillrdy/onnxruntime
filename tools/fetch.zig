@@ -58,17 +58,9 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    if (url == null or out == null) {
-        std.debug.print(
-            \\usage: fetch --url <url> --out <path> [--sha256 <hex>] [--label <text>] [--extract <dir>]
-            \\
-        , .{});
-        return error.InvalidArguments;
-    }
-
     const opts = Options{
-        .url = url.?,
-        .out = out.?,
+        .url = url orelse return error.InvalidArguments,
+        .out = out orelse return error.InvalidArguments,
         .sha256 = sha256,
         .label = label,
         .extract = extract,
@@ -83,11 +75,13 @@ pub fn main(init: std.process.Init) !void {
             }
             std.debug.print("  {s}: present but checksum differs, re-downloading\n", .{name});
         }
-    } else {
-        if (fileExists(io, opts.out)) return unpack(gpa, io, opts, name);
+    } else if (fileExists(io, opts.out)) {
+        return unpack(gpa, io, opts, name);
     }
 
-    try ensureParentDir(io, opts.out);
+    if (std.fs.path.dirname(opts.out)) |dir| {
+        try std.Io.Dir.cwd().createDirPath(io, dir);
+    }
 
     var part_buf: [4096]u8 = undefined;
     const part_path = try std.fmt.bufPrint(&part_buf, "{s}.part", .{opts.out});
@@ -116,7 +110,6 @@ pub fn main(init: std.process.Init) !void {
 
     try unpack(gpa, io, opts, name);
 }
-
 
 /// Unpack `opts.out` into `opts.extract`, if this download is an archive.
 ///
@@ -193,15 +186,7 @@ fn downloadWithCurl(gpa: std.mem.Allocator, io: std.Io, opts: Options, dest_path
         gpa.free(result.stdout);
         gpa.free(result.stderr);
     }
-
-    switch (result.term) {
-        .exited => |code| {
-            if (code != 0) {
-                return error.HttpRequestFailed;
-            }
-        },
-        else => return error.HttpRequestFailed,
-    }
+    if (result.term != .exited or result.term.exited != 0) return error.HttpRequestFailed;
 }
 
 fn downloadZig(gpa: std.mem.Allocator, io: std.Io, opts: Options, dest_path: []const u8) !void {
@@ -240,11 +225,11 @@ fn hashFile(io: std.Io, path: []const u8) !?[64]u8 {
     };
     defer file.close(io);
 
-    var read_buf: [1 << 20]u8 = undefined;
+    var read_buf: [65536]u8 = undefined;
     var file_reader = file.reader(io, &read_buf);
 
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    var chunk: [1 << 16]u8 = undefined;
+    var chunk: [65536]u8 = undefined;
     while (true) {
         const n = file_reader.interface.readSliceShort(&chunk) catch |err| switch (err) {
             error.ReadFailed => return error.ReadFailed,
@@ -259,10 +244,4 @@ fn hashFile(io: std.Io, path: []const u8) !?[64]u8 {
     var hex: [64]u8 = undefined;
     _ = std.fmt.bufPrint(&hex, "{x}", .{&digest}) catch unreachable;
     return hex;
-}
-
-fn ensureParentDir(io: std.Io, path: []const u8) !void {
-    const slash = std.mem.lastIndexOfScalar(u8, path, '/') orelse return;
-    if (slash == 0) return;
-    try std.Io.Dir.cwd().createDirPath(io, path[0..slash]);
 }

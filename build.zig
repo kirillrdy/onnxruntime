@@ -26,8 +26,9 @@ const build_zon = @import("build.zig.zon");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const fetch = fetchStep(b);
 
-    const parts = Parts.init(b, target, optimize, OpenVino.option(b, target));
+    const parts = Parts.init(b, target, optimize, OpenVino.option(b, target, fetch));
     b.installArtifact(parts.runtime());
     if (parts.openvino != null) {
         // Built once and passed along: the provider has to link the very
@@ -87,7 +88,7 @@ pub const OpenVino = struct {
     /// null when an installed OpenVINO was named and there is nothing to fetch.
     fetch: ?*std.Build.Step.Run,
 
-    fn option(b: *std.Build, target: std.Build.ResolvedTarget) ?OpenVino {
+    fn option(b: *std.Build, target: std.Build.ResolvedTarget, fetch: *std.Build.Step.Run) ?OpenVino {
         // All four declared before any is read: an option only shows up in
         // `zig build --help`, and only becomes settable, once b.option has
         // been reached, so returning early would hide the rest.
@@ -125,21 +126,15 @@ pub const OpenVino = struct {
             std.process.exit(1);
         }
 
-        if (prefix_option) |prefix| return .{
-            .include = include_option orelse b.pathJoin(&.{ prefix, "include" }),
-            .lib = lib_option orelse b.pathJoin(&.{ prefix, "lib" }),
-            .fetch = null,
-        };
+        const default_include, const default_lib, const fetch_step = if (prefix_option) |prefix|
+            .{ b.pathJoin(&.{ prefix, "include" }), b.pathJoin(&.{ prefix, "lib" }), null }
+        else
+            .{ b.pathJoin(&.{ openvinoRoot(b), "runtime", "include" }), b.pathJoin(&.{ openvinoRoot(b), "runtime", "lib", "intel64" }), fetch };
 
-        // Intel's layout, which is not a prefix: the libraries and every plugin
-        // sit together in `runtime/lib/intel64`, so both directories are named
-        // outright rather than derived. `-Dopenvino-include` and
-        // `-Dopenvino-lib` still win, for pointing at a hand-unpacked copy.
-        const root = openvinoRoot(b);
         return .{
-            .include = include_option orelse b.pathJoin(&.{ root, "runtime", "include" }),
-            .lib = lib_option orelse b.pathJoin(&.{ root, "runtime", "lib", "intel64" }),
-            .fetch = fetchStep(b),
+            .include = include_option orelse default_include,
+            .lib = lib_option orelse default_lib,
+            .fetch = fetch_step,
         };
     }
 };
@@ -173,16 +168,13 @@ fn openvinoRoot(b: *std.Build) []const u8 {
 /// working directory.
 pub fn openvinoRuntimeLibraryPaths(b: *std.Build) []const []const u8 {
     const root = openvinoRoot(b);
-    return b.allocator.dupe([]const u8, &.{
-        b.pathJoin(&.{ root, "runtime", "lib", "intel64" }),
-        b.pathJoin(&.{ root, "runtime", "3rdparty", "tbb", "lib" }),
-    }) catch @panic("OOM");
+    const paths = b.allocator.alloc([]const u8, 2) catch @panic("OOM");
+    paths[0] = b.pathJoin(&.{ root, "runtime", "lib", "intel64" });
+    paths[1] = b.pathJoin(&.{ root, "runtime", "3rdparty", "tbb", "lib" });
+    return paths;
 }
 
 /// `zig build fetch-openvino`, and the step the provider hangs off.
-///
-/// `b.dependency` is memoised but this is not, so it is called once, from
-/// `OpenVino.option`, and the result carried in the struct.
 fn fetchStep(b: *std.Build) *std.Build.Step.Run {
     const fetch_exe = b.addExecutable(.{
         .name = "fetch",
@@ -208,16 +200,6 @@ fn fetchStep(b: *std.Build) *std.Build.Step.Run {
     step.dependOn(&run.step);
     return run;
 }
-
-/// Which C++ standard library the whole build runs on. Not a per-module
-/// choice: every object here ends up in one process exchanging std::string
-/// and std::vector, so they must agree.
-const Cxx = union(enum) {
-    /// Zig's own, statically linked. Depends on nothing but libc.
-    libcxx,
-    /// The host GCC's, to match a prebuilt libopenvino.so.
-    libstdcxx: Gnu,
-};
 
 /// The host GCC installation, located by asking the compiler rather than by
 /// guessing paths, so this works the same on a distro and inside a Nix store.
@@ -261,7 +243,7 @@ const Gnu = struct {
             if (std.mem.startsWith(u8, dir, "#include <...>")) listing = true;
             if (std.mem.startsWith(u8, dir, "End of search list")) break;
             if (listing and std.mem.indexOf(u8, dir, "/c++/") != null) {
-                include.append(b.allocator, b.dupe(dir)) catch @panic("OOM");
+                include.append(b.allocator, dir) catch @panic("OOM");
             }
         }
         if (include.items.len == 0) {
@@ -278,7 +260,7 @@ const Gnu = struct {
                 std.log.err("{s} could not locate {s}", .{ cxx, file });
                 std.process.exit(1);
             }
-            out.* = b.dupe(path);
+            out.* = path;
         }
         return .{ .include = include.items, .libraries = libraries };
     }
@@ -300,14 +282,13 @@ const Parts = struct {
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     openvino: ?OpenVino,
-    cxx: Cxx,
-    ort: std.Build.LazyPath,
-    ort_root: std.Build.LazyPath,
-    protobuf: std.Build.LazyPath,
-    onnx: std.Build.LazyPath,
-    abseil: std.Build.LazyPath,
-    re2: std.Build.LazyPath,
-    cpuinfo: std.Build.LazyPath,
+    gnu: ?Gnu,
+    ort: *std.Build.Dependency,
+    protobuf: *std.Build.Dependency,
+    onnx: *std.Build.Dependency,
+    abseil: *std.Build.Dependency,
+    re2: *std.Build.Dependency,
+    cpuinfo: *std.Build.Dependency,
     protos: std.Build.LazyPath,
     includes: []const std.Build.LazyPath,
 
@@ -317,12 +298,12 @@ const Parts = struct {
         optimize: std.builtin.OptimizeMode,
         openvino: ?OpenVino,
     ) Parts {
-        const ort = b.dependency("ort_src", .{}).path(".");
-        const protobuf = b.dependency("protobuf", .{}).path(".");
-        const onnx = b.dependency("onnx", .{}).path(".");
-        const abseil = b.dependency("abseil", .{}).path(".");
-        const re2 = b.dependency("re2", .{}).path(".");
-        const cpuinfo = b.dependency("cpuinfo", .{}).path(".");
+        const ort = b.dependency("ort_src", .{});
+        const protobuf = b.dependency("protobuf", .{});
+        const onnx = b.dependency("onnx", .{});
+        const abseil = b.dependency("abseil", .{});
+        const re2 = b.dependency("re2", .{});
+        const cpuinfo = b.dependency("cpuinfo", .{});
 
         const config = b.addWriteFiles();
         _ = config.add("onnxruntime_config.h", b.fmt(ort_config_header, .{build_zon.version}));
@@ -337,24 +318,24 @@ const Parts = struct {
         // the generated headers, and it adds them for itself below.
         const includes = b.allocator.dupe(std.Build.LazyPath, &.{
             config.getDirectory(),
-            ort.path(b, "include/onnxruntime"),
-            ort.path(b, "include/onnxruntime/core/session"),
-            ort.path(b, "onnxruntime"),
-            ort.path(b, "onnxruntime/core/mlas/inc"),
-            ort.path(b, "onnxruntime/core/mlas/lib"),
-            ort.path(b, "model_package/include"),
-            onnx,
-            abseil,
-            re2,
-            protobuf.path(b, "src"),
-            cpuinfo.path(b, "include"),
-            cpuinfo.path(b, "src"),
-            b.dependency("ort_eigen", .{}).path("."),
+            ort.path("include/onnxruntime"),
+            ort.path("include/onnxruntime/core/session"),
+            ort.path("onnxruntime"),
+            ort.path("onnxruntime/core/mlas/inc"),
+            ort.path("onnxruntime/core/mlas/lib"),
+            ort.path("model_package/include"),
+            onnx.path(""),
+            abseil.path(""),
+            re2.path(""),
+            protobuf.path("src"),
+            cpuinfo.path("include"),
+            cpuinfo.path("src"),
+            b.dependency("ort_eigen", .{}).path(""),
             b.dependency("flatbuffers", .{}).path("include"),
             b.dependency("date", .{}).path("include"),
             b.dependency("gsl", .{}).path("include"),
             b.dependency("mp11", .{}).path("include"),
-            b.dependency("safeint", .{}).path("."),
+            b.dependency("safeint", .{}).path(""),
             b.dependency("json", .{}).path("single_include"),
         }) catch @panic("OOM");
 
@@ -363,9 +344,8 @@ const Parts = struct {
             .target = target,
             .optimize = optimize,
             .openvino = openvino,
-            .cxx = if (openvino == null) .libcxx else .{ .libstdcxx = Gnu.detect(b) },
+            .gnu = if (openvino == null) null else Gnu.detect(b),
             .ort = ort,
-            .ort_root = ort.path(b, "onnxruntime"),
             .protobuf = protobuf,
             .onnx = onnx,
             .abseil = abseil,
@@ -376,33 +356,23 @@ const Parts = struct {
         };
     }
 
-    /// A module compiled as C++ against `self.cxx`, seeded with the shared
-    /// include set. Every module here wants the same libc/libc++ treatment;
-    /// only the resolved target and any extra includes differ.
+    /// A module compiled as C++ against the chosen runtime, seeded with the
+    /// shared include set.
     fn cxxModule(self: Parts, target: std.Build.ResolvedTarget) *std.Build.Module {
         const mod = self.b.createModule(.{
             .target = target,
             .optimize = self.optimize,
             .link_libc = true,
-            .link_libcpp = self.cxx == .libcxx,
+            .link_libcpp = self.gnu == null,
         });
         for (self.includes) |include| mod.addIncludePath(include);
-        switch (self.cxx) {
-            .libcxx => {},
-            .libstdcxx => |gnu| {
-                // -I, not -isystem: Zig lists its own libc directories ahead of
-                // every -isystem path, and libstdc++'s <cstdlib> reaches its
-                // libc counterpart by #include_next, which only searches what
-                // comes after. The C++ headers have to be found first for that
-                // to land on glibc's stdlib.h.
-                for (gnu.include) |dir| mod.addIncludePath(.{ .cwd_relative = dir });
-                // Headers only. The libraries themselves are added by
-                // `linkStdCxx`, and only to things that actually link: an
-                // object file handed to a module that becomes a static
-                // archive is stored *in* the archive, where it is not an
-                // object the linker can use, and ld.lld's complaint about
-                // that counts as a failed build.
-            },
+        if (self.gnu) |gnu| {
+            // -I, not -isystem: Zig lists its own libc directories ahead of
+            // every -isystem path, and libstdc++'s <cstdlib> reaches its
+            // libc counterpart by #include_next, which only searches what
+            // comes after. The C++ headers have to be found first for that
+            // to land on glibc's stdlib.h.
+            for (gnu.include) |dir| mod.addIncludePath(.{ .cwd_relative = dir });
         }
         return mod;
     }
@@ -412,50 +382,34 @@ const Parts = struct {
     /// not do this: most modules here end up as static archives, which is the
     /// one place these files must not go.
     fn linkCxx(self: Parts, mod: *std.Build.Module) void {
-        switch (self.cxx) {
-            .libcxx => {}, // Zig links its own.
-            .libstdcxx => |gnu| gnu.link(mod),
-        }
+        if (self.gnu) |gnu| gnu.link(mod);
     }
 
     /// Flags for every C++ translation unit in the build.
     fn flags(self: Parts) []const []const u8 {
-        return switch (self.cxx) {
-            .libcxx => &ort_flags,
-            // OpenVINO's headers throw and catch by type, and its own build
-            // has RTTI on, so the no-RTTI pair has to come back out.
-            //
-            // -Wno-invalid-constexpr: glibc 2.41 dropped
-            // __CORRECT_ISO_CPP_MATH_H_PROTO, so libstdc++'s <cmath> now
-            // declares its own constexpr acos(float) and friends over
-            // __builtin_acosf. GCC folds those at compile time; clang does
-            // not, and rejects the definitions outright rather than warning.
-            .libstdcxx => concatFlags(self.b, &.{
-                withoutFlags(self.b, &ort_flags, &.{ "-fno-rtti", "-DORT_NO_RTTI" }),
-                &.{"-Wno-invalid-constexpr"},
-            }),
-        };
+        return if (self.openvino == null) &ort_flags else &ort_openvino_flags;
     }
 
     fn runtime(self: Parts) *std.Build.Step.Compile {
         const b = self.b;
         const ort_flags_ = self.flags();
+        const ort_root = self.ort.path("onnxruntime");
 
         const lib_mod = self.cxxModule(self.target);
         lib_mod.addIncludePath(self.protos);
 
         lib_mod.addCSourceFiles(.{ .root = self.protos, .files = &sources.onnx_proto_sources, .flags = ort_flags_ });
         lib_mod.addCSourceFiles(.{
-            .root = self.onnx,
+            .root = self.onnx.path(""),
             .files = &sources.onnx_sources,
             .flags = concatFlags(b, &.{ ort_flags_, &.{"-D__ONNX_DISABLE_STATIC_REGISTRATION"} }),
         });
-        lib_mod.addCSourceFiles(.{ .root = self.abseil, .files = &sources.abseil_sources, .flags = ort_flags_ });
-        lib_mod.addCSourceFiles(.{ .root = self.re2, .files = &sources.re2_sources, .flags = ort_flags_ });
-        lib_mod.addCSourceFiles(.{ .root = self.protobuf, .files = &sources.protobuf_lite_sources, .flags = ort_flags_ });
-        lib_mod.addCSourceFiles(.{ .root = self.cpuinfo, .files = &sources.cpuinfo_sources, .flags = &ort_c_flags });
+        lib_mod.addCSourceFiles(.{ .root = self.abseil.path(""), .files = &sources.abseil_sources, .flags = ort_flags_ });
+        lib_mod.addCSourceFiles(.{ .root = self.re2.path(""), .files = &sources.re2_sources, .flags = ort_flags_ });
+        lib_mod.addCSourceFiles(.{ .root = self.protobuf.path(""), .files = &sources.protobuf_lite_sources, .flags = ort_flags_ });
+        lib_mod.addCSourceFiles(.{ .root = self.cpuinfo.path(""), .files = &sources.cpuinfo_sources, .flags = &ort_c_flags });
         lib_mod.addCSourceFiles(.{
-            .root = self.ort.path(b, "model_package"),
+            .root = self.ort.path("model_package"),
             .files = &sources.model_package_sources,
             .flags = ort_flags_,
         });
@@ -472,11 +426,11 @@ const Parts = struct {
             &sources.ort_flatbuffers_sources,
             &sources.ort_mlas_sources,
         }) |list| {
-            lib_mod.addCSourceFiles(.{ .root = self.ort_root, .files = list, .flags = ort_flags_ });
+            lib_mod.addCSourceFiles(.{ .root = ort_root, .files = list, .flags = ort_flags_ });
         }
         for (sources.ort_file_flags) |override| {
             lib_mod.addCSourceFiles(.{
-                .root = self.ort_root,
+                .root = ort_root,
                 .files = &.{override.file},
                 .flags = concatFlags(b, &.{ ort_flags_, override.flags }),
             });
@@ -494,7 +448,7 @@ const Parts = struct {
 
             const group_mod = self.cxxModule(b.resolveTargetQuery(query));
             group_mod.addCSourceFiles(.{
-                .root = self.ort_root,
+                .root = ort_root,
                 .files = group.files,
                 .flags = concatFlags(b, &.{ ort_flags_, &mlas_group_flags, group.flags }),
             });
@@ -507,7 +461,7 @@ const Parts = struct {
 
         // Travels with the artifact: a module that links this library gets the C
         // API headers on its include path without naming a path itself.
-        lib.installHeadersDirectory(self.ort.path(b, "include/onnxruntime/core/session"), "", .{});
+        lib.installHeadersDirectory(self.ort.path("include/onnxruntime/core/session"), "", .{});
         return lib;
     }
 
@@ -527,7 +481,7 @@ const Parts = struct {
         const b = self.b;
         const mod = self.cxxModule(self.target);
         mod.addCSourceFiles(.{
-            .root = self.ort_root,
+            .root = self.ort.path("onnxruntime"),
             .files = &sources.ort_provider_host_sources,
             .flags = self.flags(),
         });
@@ -537,7 +491,7 @@ const Parts = struct {
             .linkage = .dynamic,
             .root_module = mod,
         });
-        shared.setVersionScript(self.ort_root.path(b, "core/providers/shared/version_script.lds"));
+        shared.setVersionScript(self.ort.path("onnxruntime/core/providers/shared/version_script.lds"));
         return shared;
     }
 
@@ -550,6 +504,7 @@ const Parts = struct {
     fn openvinoProvider(self: Parts, shared: *std.Build.Step.Compile) *std.Build.Step.Compile {
         const b = self.b;
         const openvino = self.openvino.?;
+        const ort_root = self.ort.path("onnxruntime");
 
         const mod = self.cxxModule(self.target);
         mod.addIncludePath(self.protos);
@@ -571,15 +526,15 @@ const Parts = struct {
                 "-Wno-c++11-narrowing",
             },
         });
-        mod.addCSourceFiles(.{ .root = self.ort_root, .files = &sources.ort_openvino_sources, .flags = flags_ });
-        mod.addCSourceFiles(.{ .root = self.ort_root, .files = &sources.ort_provider_shared_sources, .flags = flags_ });
+        mod.addCSourceFiles(.{ .root = ort_root, .files = &sources.ort_openvino_sources, .flags = flags_ });
+        mod.addCSourceFiles(.{ .root = ort_root, .files = &sources.ort_provider_shared_sources, .flags = flags_ });
 
         // The provider carries its own onnx protobuf and abseil rather than
         // sharing the runtime's: the version script below hides every symbol
         // that is not an entry point, so the two copies cannot collide.
         mod.addCSourceFiles(.{ .root = self.protos, .files = &sources.onnx_proto_sources, .flags = flags_ });
-        mod.addCSourceFiles(.{ .root = self.protobuf, .files = &sources.protobuf_lite_sources, .flags = flags_ });
-        mod.addCSourceFiles(.{ .root = self.abseil, .files = &sources.abseil_sources, .flags = flags_ });
+        mod.addCSourceFiles(.{ .root = self.protobuf.path(""), .files = &sources.protobuf_lite_sources, .flags = flags_ });
+        mod.addCSourceFiles(.{ .root = self.abseil.path(""), .files = &sources.abseil_sources, .flags = flags_ });
 
         mod.addLibraryPath(.{ .cwd_relative = openvino.lib });
         mod.linkSystemLibrary("openvino", .{});
@@ -595,7 +550,7 @@ const Parts = struct {
         });
         // Exports GetProvider, CreateEpFactories and ReleaseEpFactory, and
         // hides the rest.
-        provider.setVersionScript(self.ort_root.path(b, "core/providers/openvino/version_script.lds"));
+        provider.setVersionScript(self.ort.path("onnxruntime/core/providers/openvino/version_script.lds"));
         provider.root_module.linkLibrary(shared);
         // The runtime dlopens providers_shared with RTLD_GLOBAL before any
         // provider, so by this point the symbol is already in the process.
@@ -610,7 +565,7 @@ const Parts = struct {
     }
 };
 
-fn buildProtoc(b: *std.Build, protobuf: std.Build.LazyPath) *std.Build.Step.Compile {
+fn buildProtoc(b: *std.Build, protobuf: *std.Build.Dependency) *std.Build.Step.Compile {
     // Pinned rather than inherited from the caller: this protoc runs three
     // times on three small .proto files, so codegen quality buys nothing, and
     // -Os builds protobuf roughly twice as fast as any other mode. Pinning
@@ -625,7 +580,7 @@ fn buildProtoc(b: *std.Build, protobuf: std.Build.LazyPath) *std.Build.Step.Comp
         .link_libc = true,
         .link_libcpp = true,
     });
-    protoc_mod.addIncludePath(protobuf.path(b, "src"));
+    protoc_mod.addIncludePath(protobuf.path("src"));
     const flags = [_][]const u8{
         "-std=c++17",
         "-DGOOGLE_PROTOBUF_CMAKE_BUILD",
@@ -638,18 +593,18 @@ fn buildProtoc(b: *std.Build, protobuf: std.Build.LazyPath) *std.Build.Step.Comp
         &sources.protoc_sources,
         &.{"src/google/protobuf/compiler/main.cc"},
     }) |list| {
-        protoc_mod.addCSourceFiles(.{ .root = protobuf, .files = list, .flags = &flags });
+        protoc_mod.addCSourceFiles(.{ .root = protobuf.path(""), .files = list, .flags = &flags });
     }
     return b.addExecutable(.{ .name = "protoc", .root_module = protoc_mod });
 }
 
-fn generateOnnxProto(b: *std.Build, protoc_exe: *std.Build.Step.Compile, onnx: std.Build.LazyPath) std.Build.LazyPath {
+fn generateOnnxProto(b: *std.Build, protoc_exe: *std.Build.Step.Compile, onnx: *std.Build.Dependency) std.Build.LazyPath {
     const run = b.addRunArtifact(protoc_exe);
     for ([_][]const u8{ "onnx-ml.proto", "onnx-operators-ml.proto", "onnx-data.proto" }) |proto| {
-        run.addFileArg(onnx.path(b, b.fmt("onnx/{s}", .{proto})));
+        run.addFileArg(onnx.path(b.fmt("onnx/{s}", .{proto})));
     }
     run.addArg("-I");
-    run.addDirectoryArg(onnx);
+    run.addDirectoryArg(onnx.path(""));
     run.addArg("--cpp_out");
     return run.addOutputDirectoryArg("onnx-proto");
 }
@@ -658,18 +613,8 @@ fn concatFlags(b: *std.Build, parts: []const []const []const u8) []const []const
     return std.mem.concat(b.allocator, []const u8, parts) catch @panic("OOM");
 }
 
-fn withoutFlags(b: *std.Build, flags: []const []const u8, remove: []const []const u8) []const []const u8 {
-    var kept: std.ArrayList([]const u8) = .empty;
-    outer: for (flags) |flag| {
-        for (remove) |drop| if (std.mem.eql(u8, flag, drop)) continue :outer;
-        kept.append(b.allocator, flag) catch @panic("OOM");
-    }
-    return kept.items;
-}
-
-const ort_flags = [_][]const u8{
+const ort_base_flags = [_][]const u8{
     "-std=c++20",
-    "-fno-rtti",
     "-DCPUINFO_SUPPORTED",
     "-DCPUINFO_SUPPORTED_PLATFORM=1",
     "-DEIGEN_MPL2_ONLY",
@@ -682,11 +627,26 @@ const ort_flags = [_][]const u8{
     "-D__ONNX_NO_DOC_STRINGS",
     "-DONNX_USE_LITE_PROTO=1",
     "-DORT_ENABLE_STREAM",
-    "-DORT_NO_RTTI",
     "-DPLATFORM_POSIX",
     "-fno-sanitize=undefined",
     "-DGOOGLE_PROTOBUF_NO_RTTI=1",
     "-w",
+};
+
+const ort_flags = ort_base_flags ++ [_][]const u8{
+    "-fno-rtti",
+    "-DORT_NO_RTTI",
+};
+
+// OpenVINO's headers throw and catch by type, and its own build has RTTI on,
+// so the no-RTTI pair is omitted.
+//
+// -Wno-invalid-constexpr: glibc 2.41 dropped __CORRECT_ISO_CPP_MATH_H_PROTO,
+// so libstdc++'s <cmath> now declares its own constexpr acos(float) and friends
+// over __builtin_acosf. GCC folds those at compile time; clang does not, and
+// rejects the definitions outright rather than warning.
+const ort_openvino_flags = ort_base_flags ++ [_][]const u8{
+    "-Wno-invalid-constexpr",
 };
 
 const ort_c_flags = [_][]const u8{
