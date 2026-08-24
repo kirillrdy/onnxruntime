@@ -28,9 +28,16 @@ const build_zon = @import("build.zig.zon");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const fetch = fetchStep(b);
+    const fetch_openvino = fetchStep(b);
+    const fetch_cuda = fetchCudaStep(b);
 
-    const parts = Parts.init(b, target, optimize, OpenVino.option(b, target, fetch), Cuda.option(b, target));
+    const parts = Parts.init(
+        b,
+        target,
+        optimize,
+        OpenVino.option(b, target, fetch_openvino),
+        Cuda.option(b, target, fetch_cuda),
+    );
     const lib = parts.runtime();
     b.installArtifact(lib);
 
@@ -89,6 +96,13 @@ pub const Provider = enum {
     }
 };
 
+/// Target execution provider device.
+pub const DeviceOption = enum {
+    cpu,
+    openvino,
+    cuda,
+};
+
 /// What `select` hands back: the dependency, which provider it carries, and the
 /// few things a consumer has to do differently because of that choice.
 ///
@@ -108,6 +122,8 @@ pub const Selection = struct {
     /// so sits in the build cache with its own oneTBB beside it, neither of
     /// which is anywhere the dynamic loader looks. See `runtimeLibraryPaths`.
     fetched_openvino: bool = false,
+    /// Set when the CUDA toolkit behind this was downloaded rather than named.
+    fetched_cuda: bool = false,
 
     /// Directories a program built against this has to have on its library path
     /// at run time, beyond what the system already provides. Empty unless the
@@ -180,14 +196,11 @@ pub fn select(
     optimize: std.builtin.OptimizeMode,
     fallback: Provider,
 ) Selection {
-    // Declared here rather than resolved through `OpenVino.option`, which is
-    // what this package's own build() calls. That returns a struct already
-    // worked out against the machine -- and, for a fetched OpenVINO, a download
-    // step belonging to whichever builder asked for it. A consumer is
-    // forwarding, so what it wants is the options as they were typed.
-    //
-    // All seven asked for before any is read: an option only shows up in `zig
-    // build --help`, and only becomes settable, once b.option has been reached.
+    const device = b.option(
+        DeviceOption,
+        "device",
+        "Target execution provider device: cpu, openvino, cuda",
+    );
     const openvino = b.option(
         []const u8,
         "openvino",
@@ -203,6 +216,11 @@ pub fn select(
         "openvino-lib",
         "Directory holding libopenvino.so and the plugins, if not <prefix>/lib",
     );
+    const openvino_fetch = b.option(
+        bool,
+        "openvino-fetch",
+        "Build against the OpenVINO release `fetch-openvino` downloads, rather than one installed on the machine",
+    ) orelse false;
     const cuda = b.option(
         []const u8,
         "cuda",
@@ -223,6 +241,11 @@ pub fn select(
         "cuda-ccbin",
         "Host C++ compiler for nvcc to drive, if the default c++ is newer than the toolkit accepts",
     );
+    const cuda_fetch = b.option(
+        bool,
+        "cuda-fetch",
+        "Build against the CUDA release `fetch-cuda` downloads, rather than one installed on the machine",
+    ) orelse false;
 
     // One runtime takes one provider library. Two would need two of everything
     // in `Selection` -- and the device asked for would stop naming one of them.
@@ -231,14 +254,16 @@ pub fn select(
         std.process.exit(1);
     }
 
-    // Naming a prefix is always honoured. Otherwise `fallback` decides, which
-    // is how a consumer's own device option reaches down here: asking for a
-    // device the CPU provider cannot serve is what calls for a provider.
-    const provider: Provider = if (openvino != null)
+    // Naming a prefix or fetch is always honoured. Otherwise `device` or `fallback` decides.
+    const provider: Provider = if (openvino != null or openvino_fetch)
         .openvino
-    else if (cuda != null)
+    else if (cuda != null or cuda_fetch)
         .cuda
-    else
+    else if (device) |d| switch (d) {
+        .cpu => .none,
+        .openvino => .openvino,
+        .cuda => .cuda,
+    } else
         fallback;
 
     switch (provider) {
@@ -251,12 +276,6 @@ pub fn select(
 
         .openvino => return .{
             .b = b,
-            // With no prefix named there is nothing installed to build
-            // against, so the package downloads Intel's release instead.
-            // -Dopenvino-include and -Dopenvino-lib are for describing an
-            // installed one whose layout is unusual -- a split-output package
-            // manager, say -- so they ride along with the prefix and not with
-            // the download, whose layout the package already knows.
             .dependency = if (openvino) |prefix| b.dependency("onnxruntime", .{
                 .target = target,
                 .optimize = optimize,
@@ -274,31 +293,26 @@ pub fn select(
         },
 
         .cuda => {
-            // No equivalent of -Dopenvino-fetch: NVIDIA's toolkit is not a
-            // tarball to unpack beside the build, and nvcc has to come out of a
-            // real installation.
-            const prefix = cuda orelse {
-                std.log.err(
-                    "reaching an NVIDIA GPU needs -Dcuda=<prefix>: there is no toolkit to download, and nvcc is what compiles the provider's device code",
-                    .{},
-                );
-                std.process.exit(1);
-            };
-            const ccbin = cuda_ccbin orelse b.graph.environ_map.get("CXX") orelse "c++";
+            const ccbin = cuda_ccbin orelse Cuda.detectCcbin(b, cuda orelse cudaRoot(b));
             return .{
                 .b = b,
-                .dependency = b.dependency("onnxruntime", .{
+                .dependency = if (cuda) |prefix| b.dependency("onnxruntime", .{
                     .target = target,
                     .optimize = optimize,
                     .cuda = prefix,
                     .@"cudnn-include" = cudnn_include orelse b.pathJoin(&.{ prefix, "include" }),
                     .@"cuda-arch" = cuda_arch orelse "89",
                     .@"cuda-ccbin" = ccbin,
+                }) else b.dependency("onnxruntime", .{
+                    .target = target,
+                    .optimize = optimize,
+                    .@"cuda-fetch" = true,
+                    .@"cuda-arch" = cuda_arch orelse "89",
+                    .@"cuda-ccbin" = ccbin,
                 }),
                 .provider = .cuda,
-                // Whatever nvcc drives, since the .cu objects and the .cc
-                // objects have to agree -- see `Cuda`.
                 .cxx = ccbin,
+                .fetched_cuda = cuda == null,
             };
         },
     }
@@ -420,38 +434,170 @@ pub const Cuda = struct {
     /// over every host translation unit inside a `.cu` file, so the runtime
     /// and the other providers have to link whatever libstdc++ it supplies.
     ccbin: []const u8,
+    /// The download this was unpacked from, for the provider to wait on, or
+    /// null when an installed CUDA was named and there is nothing to fetch.
+    fetch: ?*std.Build.Step = null,
 
     fn compiler(self: Cuda, b: *std.Build) []const u8 {
         return b.pathJoin(&.{ self.prefix, "bin", "nvcc" });
     }
 
-    /// Read the toolkit's version as an integer like `1208` for 12.8, probed
+    /// The newest GCC major this toolkit will drive, read out of its own
+    /// `crt/host_config.h`:
+    ///
+    ///     #if __GNUC__ > 14
+    ///     #error -- unsupported GNU version! ...
+    ///
+    /// A downloaded toolkit is not on disk yet the first time this runs -- the
+    /// fetch is a build step and this is configuration -- so the pinned
+    /// release's gate stands in until there is a header to read.
+    fn hostCompilerMax(b: *std.Build, prefix: []const u8) u32 {
+        const path = b.pathJoin(&.{ prefix, "include", "crt", "host_config.h" });
+        const source = std.Io.Dir.cwd().readFileAlloc(
+            b.graph.io,
+            path,
+            b.allocator,
+            .limited(1 << 20),
+        ) catch return cuda_fetch_gnuc_max;
+        const marker = "#if __GNUC__ > ";
+        const pos = std.mem.indexOf(u8, source, marker) orelse return cuda_fetch_gnuc_max;
+        const rest = source[pos + marker.len ..];
+        const end = std.mem.indexOfAny(u8, rest, " \r\n") orelse return cuda_fetch_gnuc_max;
+        return std.fmt.parseInt(u32, rest[0..end], 10) catch cuda_fetch_gnuc_max;
+    }
+
+    /// The GCC major `cxx` reports, or null when it is not a GCC that runs.
+    ///
+    /// clang is rejected rather than version-checked: `host_config.h` gates it
+    /// separately, and CUDA refuses the libc++ that a clang here would most
+    /// likely bring with it ("libc++ is not supported on x86 system").
+    fn gnuMajor(b: *std.Build, cxx: []const u8) ?u32 {
+        var code: u8 = undefined;
+        const banner = b.runAllowFail(&.{ cxx, "--version" }, &code, .ignore) catch return null;
+        if (std.mem.indexOf(u8, banner, "clang") != null) return null;
+        const out = b.runAllowFail(&.{ cxx, "-dumpversion" }, &code, .ignore) catch return null;
+        const trimmed = std.mem.trim(u8, out, " \t\r\n");
+        const dot = std.mem.indexOfScalar(u8, trimmed, '.') orelse trimmed.len;
+        return std.fmt.parseInt(u32, trimmed[0..dot], 10) catch null;
+    }
+
+    /// A host compiler for nvcc, when `-Dcuda-ccbin` did not name one.
+    ///
+    /// nvcc runs the host compiler over every host translation unit in a `.cu`
+    /// file, and a GCC newer than the toolkit knows fails deep inside
+    /// libstdc++, on builtins nvcc's frontend claims through `__has_builtin`
+    /// and then does not implement: `__is_pointer` and the rest of the type
+    /// traits, and `__builtin_operator_new` behind `_GLIBCXX_OPERATOR_NEW`.
+    /// The traits have a documented switch out
+    /// (`_GLIBCXX_DO_NOT_USE_BUILTIN_TRAITS`); operator new does not, so there
+    /// is no getting a too-new GCC through, and the choice is made here rather
+    /// than left to whatever `c++` happens to be.
+    ///
+    /// `nvcc_flags` carries `-allow-unsupported-compiler`, so without this the
+    /// mismatch arrives as thousands of errors from inside libstdc++ twenty
+    /// minutes in, rather than as nvcc's own one-line refusal.
+    fn detectCcbin(b: *std.Build, prefix: []const u8) []const u8 {
+        const max = hostCompilerMax(b, prefix);
+
+        // $CXX and the unsuffixed names first, so a machine whose default
+        // compiler already suits keeps using it. Then the versioned names
+        // distributions install alongside it, newest acceptable first.
+        var candidates: std.ArrayList([]const u8) = .empty;
+        if (b.graph.environ_map.get("CXX")) |cxx| candidates.append(b.allocator, cxx) catch @panic("OOM");
+        candidates.appendSlice(b.allocator, &.{ "c++", "g++" }) catch @panic("OOM");
+        var major = max;
+        while (major >= 9) : (major -= 1) {
+            candidates.append(b.allocator, b.fmt("g++-{d}", .{major})) catch @panic("OOM");
+        }
+
+        for (candidates.items) |cxx| {
+            const found = gnuMajor(b, cxx) orelse continue;
+            if (found <= max) return cxx;
+        }
+
+        const tried = std.mem.join(b.allocator, ", ", candidates.items) catch @panic("OOM");
+        std.log.err(
+            "no host C++ compiler for nvcc: this CUDA toolkit accepts GCC {d} and older, and none of these is one: {s}. Install a g++ it supports, or name one with -Dcuda-ccbin=<path>",
+            .{ max, tried },
+        );
+        std.process.exit(1);
+    }
+
+    /// Puts the tools nvcc spawns behind the loader, on a system whose loader
+    /// is not where NVIDIA's binaries expect it.
+    ///
+    /// `compilerCommand` gets nvcc itself running by invoking it through the
+    /// loader, but nvcc then spawns cudafe++, cicc and ptxas, whose ELF interp
+    /// is a hard-coded /lib64/ld-linux-x86-64.so.2 -- on NixOS a stub that
+    /// answers "Could not start dynamically linked executable" and nothing
+    /// else. nvcc reaches them by `execve` on a path it builds from its own
+    /// location, never through PATH, so the only place to intervene is the
+    /// path it names: each binary moves aside to `.real` and a script that
+    /// execs it through the loader takes the name.
+    ///
+    /// nvcc is left alone. It is the one tool nothing here spawns for us, and
+    /// `compilerCommand` already invokes it through the loader -- which cannot
+    /// run a shell script, so wrapping it would break the very thing that
+    /// works.
+    ///
+    /// Done unconditionally rather than behind a check for the loader NVIDIA
+    /// expects: on NixOS that path *is* occupied, by the stub, so its presence
+    /// says nothing. The loader used is the one the host compiler itself runs
+    /// under, which is the right answer on any Linux.
+    ///
+    /// Idempotent: a tool with a `.real` beside it has already been moved.
+    fn nixWrapStep(self: Cuda, b: *std.Build) *std.Build.Step.Run {
+        const loader = Gnu.detectLd(b, self.ccbin) orelse "/lib64/ld-linux-x86-64.so.2";
+        const script = b.fmt(
+            \\set -e
+            \\prefix=$(cd "{[prefix]s}" && pwd)
+            \\for d in "$prefix/bin" "$prefix/nvvm/bin"; do
+            \\  [ -d "$d" ] || continue
+            \\  for f in "$d"/*; do
+            \\    [ -f "$f" ] && [ -x "$f" ] || continue
+            \\    case "$f" in *.real|*/nvcc) continue;; esac
+            \\    [ -f "$f.real" ] && continue
+            \\    printf '\x7fELF' | cmp -s -n 4 - "$f" || continue
+            \\    mv "$f" "$f.real"
+            \\    printf '#!/bin/sh\nexec "{[loader]s}" "%s.real" "$@"\n' "$f" > "$f"
+            \\    chmod +x "$f"
+            \\  done
+            \\done
+        , .{ .prefix = self.prefix, .loader = loader });
+
+        const run = b.addSystemCommand(&.{ "sh", "-c", script });
+        run.has_side_effects = true;
+        if (self.fetch) |fetch| run.step.dependOn(fetch);
+        return run;
+    }
+    fn compilerCommand(self: Cuda, b: *std.Build) []const []const u8 {
+        const nvcc_path = self.compiler(b);
+        if (self.fetch != null) {
+            if (Gnu.detectLd(b, self.ccbin)) |ld| {
+                return b.allocator.dupe([]const u8, &.{ ld, nvcc_path }) catch @panic("OOM");
+            }
+        }
+        return b.allocator.dupe([]const u8, &.{nvcc_path}) catch @panic("OOM");
+    }
+
+    /// Read the toolkit's version as an integer like `1300` for 13.0, probed
     /// from nvcc.
     fn version(self: Cuda, b: *std.Build) u32 {
+        if (self.fetch != null) return cuda_fetch_version;
         var code: u8 = undefined;
-        const out = b.runAllowFail(&.{ self.compiler(b), "--version" }, &code, .ignore) catch |err| {
-            std.log.err("running `{s} --version`: {s}", .{ self.compiler(b), @errorName(err) });
-            std.process.exit(1);
-        };
-        // nvcc: NVIDIA (R) Cuda compiler driver
-        // Copyright (c) 2005-2024 NVIDIA Corporation
-        // Built on Thu_Sep_12_02:18:05_PDT_2024
-        // Cuda compilation tools, release 12.6, V12.6.77
+        const out = b.runAllowFail(&.{ self.compiler(b), "--version" }, &code, .ignore) catch return cuda_fetch_version;
         const release_marker = "release ";
-        const pos = std.mem.indexOf(u8, out, release_marker) orelse return 0;
+        const pos = std.mem.indexOf(u8, out, release_marker) orelse return cuda_fetch_version;
         const rest = out[pos + release_marker.len ..];
         var parts = std.mem.splitScalar(u8, rest, '.');
-        const major = std.fmt.parseInt(u32, parts.next() orelse return 0, 10) catch return 0;
-        const minor_str = parts.next() orelse return 0;
+        const major = std.fmt.parseInt(u32, parts.next() orelse return cuda_fetch_version, 10) catch return cuda_fetch_version;
+        const minor_str = parts.next() orelse return cuda_fetch_version;
         const comma = std.mem.indexOfScalar(u8, minor_str, ',') orelse minor_str.len;
-        const minor = std.fmt.parseInt(u32, minor_str[0..comma], 10) catch return 0;
+        const minor = std.fmt.parseInt(u32, minor_str[0..comma], 10) catch return cuda_fetch_version;
         return major * 100 + minor;
     }
 
-    fn option(b: *std.Build, target: std.Build.ResolvedTarget) ?Cuda {
-        // All four declared before any is read: an option only shows up in
-        // `zig build --help`, and only becomes settable, once b.option has
-        // been reached.
+    fn option(b: *std.Build, target: std.Build.ResolvedTarget, fetch: *std.Build.Step) ?Cuda {
         const prefix_option = b.option(
             []const u8,
             "cuda",
@@ -472,20 +618,205 @@ pub const Cuda = struct {
             "cuda-ccbin",
             "Host C++ compiler for nvcc to drive, if the default c++ is newer than the toolkit accepts",
         );
+        const fetch_option = b.option(
+            bool,
+            "cuda-fetch",
+            "Build against the CUDA release `fetch-cuda` downloads, rather than one installed on the machine",
+        ) orelse false;
+        const device_option = b.option(
+            DeviceOption,
+            "device",
+            "Target execution provider device: cpu, openvino, cuda",
+        );
 
-        const prefix = prefix_option orelse return null;
+        const is_cuda = prefix_option != null or fetch_option or (device_option != null and device_option.? == .cuda);
+        if (!is_cuda) return null;
+
+        if (prefix_option != null and fetch_option) {
+            std.log.err("-Dcuda names an installed CUDA toolkit and -Dcuda-fetch downloads one; pass one or the other", .{});
+            std.process.exit(1);
+        }
+
         if (!target.query.isNative()) {
             std.log.err("-Dcuda builds against the host's libstdc++ and cannot cross-compile", .{});
             std.process.exit(1);
         }
+
+        const prefix = prefix_option orelse cudaRoot(b);
+        const default_include, const fetch_step = if (prefix_option) |_|
+            .{ cudnn_include_option orelse b.pathJoin(&.{ prefix, "include" }), null }
+        else
+            .{ cudnn_include_option orelse b.pathJoin(&.{ prefix, "include" }), fetch };
+
+        // Resolved before the struct so the gate check below can see it, and
+        // so an explicitly named -Dcuda-ccbin gets the same treatment as one
+        // found here: what matters is which GCC nvcc ends up driving.
+        const ccbin = ccbin_option orelse detectCcbin(b, prefix);
+
         return .{
             .prefix = prefix,
-            .cudnn_include = cudnn_include_option orelse b.pathJoin(&.{ prefix, "include" }),
+            .cudnn_include = default_include,
             .arch = arch_option orelse "89",
-            .ccbin = ccbin_option orelse b.graph.environ_map.get("CXX") orelse "c++",
+            .ccbin = ccbin,
+            .fetch = fetch_step,
         };
     }
 };
+
+const CudaPackage = struct {
+    url: []const u8,
+    archive: []const u8,
+    sha256: []const u8,
+    label: []const u8,
+};
+
+/// The GCC gate in the pinned toolkit's `crt/host_config.h`, for deciding on a
+/// host compiler before the download that carries the header has happened.
+/// Bump it with `cuda_packages`.
+const cuda_fetch_gnuc_max = 15;
+
+/// The pinned toolkit's release, as `Cuda.version` spells it, for the same
+/// reason: what a feature check should assume before nvcc is there to ask.
+/// Bump it with `cuda_packages`.
+const cuda_fetch_version = 1300;
+
+const cuda_packages = [_]CudaPackage{
+    .{
+        .url = "https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvcc/linux-x86_64/cuda_nvcc-linux-x86_64-13.0.88-archive.tar.xz",
+        .archive = "cuda_nvcc-linux-x86_64-13.0.88-archive.tar.xz",
+        .sha256 = "48e35be3cfbf4b4fbc16828eaec8a7048ee789403049dc409f7b643d6259cf7a",
+        .label = "CUDA nvcc 13.0 (25 MiB)",
+    },
+    .{
+        // New in CUDA 13: the `crt/` headers -- host_config.h, math_functions.h
+        // and the rest of what nvcc force-includes -- moved out of cuda_nvcc,
+        // whose archive is now just the binaries. Without this the toolkit
+        // cannot compile anything.
+        .url = "https://developer.download.nvidia.com/compute/cuda/redist/cuda_crt/linux-x86_64/cuda_crt-linux-x86_64-13.0.88-archive.tar.xz",
+        .archive = "cuda_crt-linux-x86_64-13.0.88-archive.tar.xz",
+        .sha256 = "5a3279a049ffc1cdb951c44cb95206acfdde9e9ae5e87825fc18d7e4a6878bb0",
+        .label = "CUDA crt 13.0 (0.4 MiB)",
+    },
+    .{
+        // Also new in CUDA 13: cicc, the device-code compiler nvcc drives, and
+        // the libdevice bitcode it links against. Both used to ride along in
+        // cuda_nvcc; without them nvcc gets as far as the front end and stops.
+        .url = "https://developer.download.nvidia.com/compute/cuda/redist/libnvvm/linux-x86_64/libnvvm-linux-x86_64-13.0.88-archive.tar.xz",
+        .archive = "libnvvm-linux-x86_64-13.0.88-archive.tar.xz",
+        .sha256 = "17ef1665b63670887eeba7d908da5669fa8c66bb73b5b4c1367f49929c086353",
+        .label = "CUDA libnvvm 13.0 (42 MiB)",
+    },
+    .{
+        .url = "https://developer.download.nvidia.com/compute/cuda/redist/cuda_cudart/linux-x86_64/cuda_cudart-linux-x86_64-13.0.88-archive.tar.xz",
+        .archive = "cuda_cudart-linux-x86_64-13.0.88-archive.tar.xz",
+        .sha256 = "bc44226f069402ab327bcf9e754660621aa6bc61fb7fc6afe03b794dfaaab658",
+        .label = "CUDA cudart 13.0 (1.4 MiB)",
+    },
+    .{
+        // cudnn_frontend's experimental/nvrtc_shim.h includes <nvrtc.h>, so the
+        // headers are needed even though NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING
+        // means nothing here links against the library.
+        .url = "https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvrtc/linux-x86_64/cuda_nvrtc-linux-x86_64-13.0.88-archive.tar.xz",
+        .archive = "cuda_nvrtc-linux-x86_64-13.0.88-archive.tar.xz",
+        .sha256 = "00038aac08e1dba6f1933237dbfb217ac6452ae24fab970edcac808f103ca64b",
+        .label = "CUDA nvrtc 13.0 (111 MiB)",
+    },
+    .{
+        .url = "https://developer.download.nvidia.com/compute/cuda/redist/cuda_cccl/linux-x86_64/cuda_cccl-linux-x86_64-13.0.85-archive.tar.xz",
+        .archive = "cuda_cccl-linux-x86_64-13.0.85-archive.tar.xz",
+        .sha256 = "ed845eae8c1767706b6ee91e40c608a03f6f633551a849b63f7346d32d73ee60",
+        .label = "CUDA cccl 13.0 (1.3 MiB)",
+    },
+    .{
+        .url = "https://developer.download.nvidia.com/compute/cuda/redist/libcublas/linux-x86_64/libcublas-linux-x86_64-13.0.2.14-archive.tar.xz",
+        .archive = "libcublas-linux-x86_64-13.0.2.14-archive.tar.xz",
+        .sha256 = "158c1d7e862282d5218ed82f173ba14679c0f8afa1fe8cb4a3a34a4c0a9a5ff9",
+        .label = "CUDA libcublas 13.0 (763 MiB)",
+    },
+    .{
+        .url = "https://developer.download.nvidia.com/compute/cuda/redist/libcurand/linux-x86_64/libcurand-linux-x86_64-10.4.0.35-archive.tar.xz",
+        .archive = "libcurand-linux-x86_64-10.4.0.35-archive.tar.xz",
+        .sha256 = "ee0dbf473998050bda876cb945634bec87d44b90b05a5550e9c2499ab7c1a5c3",
+        .label = "CUDA libcurand 13.0 (82 MiB)",
+    },
+    .{
+        .url = "https://developer.download.nvidia.com/compute/cuda/redist/libcufft/linux-x86_64/libcufft-linux-x86_64-12.0.0.61-archive.tar.xz",
+        .archive = "libcufft-linux-x86_64-12.0.0.61-archive.tar.xz",
+        .sha256 = "5cdef1238c270f8f148da18587fdba8b9478c596e40f5490bba2b15c94915dd9",
+        .label = "CUDA libcufft 13.0 (338 MiB)",
+    },
+    .{
+        // The _cuda13 build: cuDNN ships one archive per CUDA major, and the
+        // _cuda12 one links against the previous cudart soname.
+        .url = "https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/linux-x86_64/cudnn-linux-x86_64-9.14.0.64_cuda13-archive.tar.xz",
+        .archive = "cudnn-linux-x86_64-9.14.0.64_cuda13-archive.tar.xz",
+        .sha256 = "75b8c5feb7e65107dc8881af2cf245f9be77274f607c019a966347e36d1526e7",
+        .label = "cuDNN 9.14 (616 MiB)",
+    },
+};
+
+/// Where the downloaded CUDA and cuDNN redistributables are unpacked.
+fn cudaRoot(b: *std.Build) []const u8 {
+    return b.cache_root.join(b.allocator, &.{ "onnxruntime", "cuda" }) catch @panic("OOM");
+}
+
+/// `zig build fetch-cuda`, and the step the provider hangs off.
+fn fetchCudaStep(b: *std.Build) *std.Build.Step {
+    const fetch_exe = b.addExecutable(.{
+        .name = "fetch",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/fetch.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+
+    const step = b.step("fetch-cuda", "Download NVIDIA CUDA 13.0 and cuDNN 9.14 redistributables, for -Dcuda-fetch");
+    const root = cudaRoot(b);
+    const patch = patchCudaMathStep(b, root);
+
+    for (cuda_packages) |pkg| {
+        const archive = b.cache_root.join(b.allocator, &.{ "onnxruntime", pkg.archive }) catch @panic("OOM");
+        const run = b.addRunArtifact(fetch_exe);
+        run.has_side_effects = true;
+        run.addArgs(&.{
+            "--url",     pkg.url,
+            "--out",     archive,
+            "--sha256",  pkg.sha256,
+            "--extract", root,
+            "--label",   pkg.label,
+        });
+        patch.step.dependOn(&run.step);
+    }
+    step.dependOn(&patch.step);
+    return step;
+}
+
+/// glibc 2.41 grew the C23 `rsqrt`/`sinpi`/`cospi` family, declared -- as every
+/// declaration in <math.h> is -- `noexcept`. CUDA's `crt/math_functions.h`
+/// declares those same six names itself and, unlike the couple of hundred
+/// around them, without the `__THROW` that would agree with glibc. nvcc force-
+/// includes its header, so the two collide and every translation unit that
+/// reaches <cmath> is rejected before it starts.
+///
+/// Add the exception specification the six are missing. This is the patch the
+/// distributions carry, and it produces their header byte for byte; sed rather
+/// than a real patch file because a context diff would have to be re-cut for
+/// every toolkit release, while the declarations themselves have not moved.
+fn patchCudaMathStep(b: *std.Build, root: []const u8) *std.Build.Step.Run {
+    const header = b.pathJoin(&.{ root, "include", "crt", "math_functions.h" });
+    const run = b.addSystemCommand(&.{
+        "sed",
+        "-E",
+        "-i",
+        // Already-patched lines end in `noexcept (true);` and no longer match,
+        // so re-running this costs a rewrite and changes nothing.
+        "s/^(extern __DEVICE_FUNCTIONS_DECL__ __device_builtin__ +(double|float) +(rsqrtf?|sinpif?|cospif?)\\([^)]*\\));$/\\1 noexcept (true);/",
+        header,
+    });
+    run.has_side_effects = true;
+    return run;
+}
 
 /// The OpenVINO release `fetch-openvino` downloads.
 ///
@@ -614,6 +945,12 @@ const Gnu = struct {
         return .{ .include = include.items, .libraries = libraries };
     }
 
+    fn detectLd(b: *std.Build, cxx: []const u8) ?[]const u8 {
+        const path = std.mem.trim(u8, run(b, b.fmt("{s} -print-file-name=ld-linux-x86-64.so.2", .{cxx})), " \t\r\n");
+        if (std.mem.eql(u8, path, "ld-linux-x86-64.so.2") or !std.mem.startsWith(u8, path, "/")) return null;
+        return path;
+    }
+
     fn run(b: *std.Build, command: []const u8) []const u8 {
         var code: u8 = undefined;
         return b.runAllowFail(&.{ "sh", "-c", command }, &code, .ignore) catch |err| {
@@ -701,7 +1038,12 @@ const Parts = struct {
         // -gline-tables-only: full DWARF for a build this size overruns what
         // Mach-O's debug map can address, and the line tables are all the
         // symbolicated backtraces here need.
-        const cxx_base = if (openvino == null) &ort_flags else &ort_openvino_flags;
+        const cxx_base = if (openvino != null)
+            &ort_openvino_flags
+        else if (cuda != null)
+            &ort_cuda_flags
+        else
+            &ort_flags;
         var cxx_flags = if (target.result.os.tag.isDarwin())
             concatFlags(b, &.{ cxx_base, &.{"-gline-tables-only"} })
         else
@@ -981,8 +1323,16 @@ const Parts = struct {
 
         for (self.deviceObjects()) |object| mod.addObjectFile(object);
 
+        // An installed toolkit keeps its libraries in lib or in lib64 depending
+        // on the distribution, so both go on the path and the one that is not
+        // there costs nothing. NVIDIA's redistributables are only ever lib, and
+        // naming a directory the download will never contain earns a linker
+        // warning that Zig then reports in its failure style -- which makes a
+        // build that succeeded read as a build that did not.
         mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ cuda.prefix, "lib" }) });
-        mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ cuda.prefix, "lib64" }) });
+        if (cuda.fetch == null) {
+            mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ cuda.prefix, "lib64" }) });
+        }
         // cuDNN and cuFFT are deliberately absent: the provider dlopens them by
         // soname when an op needs them (see cudnn_loader.cc), so a machine that
         // never runs a convolution needs neither installed.
@@ -997,7 +1347,9 @@ const Parts = struct {
         // stub directory is deliberately not an RPATH below: resolving there at
         // run time would find a driver that can do nothing.
         mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ cuda.prefix, "lib", "stubs" }) });
-        mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ cuda.prefix, "lib64", "stubs" }) });
+        if (cuda.fetch == null) {
+            mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ cuda.prefix, "lib64", "stubs" }) });
+        }
         mod.linkSystemLibrary("cuda", .{});
         mod.addRPath(.{ .cwd_relative = b.pathJoin(&.{ cuda.prefix, "lib" }) });
         self.linkCxx(mod);
@@ -1010,6 +1362,7 @@ const Parts = struct {
         provider.setVersionScript(self.ort.path("onnxruntime/core/providers/cuda/version_script.lds"));
         provider.root_module.linkLibrary(shared);
         provider.root_module.addRPath(.{ .cwd_relative = "$ORIGIN" });
+        if (cuda.fetch) |fetch| provider.step.dependOn(fetch);
         return provider;
     }
 
@@ -1025,6 +1378,13 @@ const Parts = struct {
         var list: std.ArrayList(std.Build.LazyPath) = .empty;
         list.appendSlice(b.allocator, &.{
             .{ .cwd_relative = b.pathJoin(&.{ cuda.prefix, "include" }) },
+            // CUDA 13 moved CCCL -- <cuda/std/utility> and the rest of what
+            // CUTLASS reaches for -- from include/ down into include/cccl/.
+            // nvcc puts it back on its own, through the SYSTEM_INCLUDES line in
+            // nvcc.profile, so only the host compiles need telling; without it
+            // the handful of `.cc` files that include CUTLASS cannot find it.
+            // Harmless on 12.x, where the directory is simply absent.
+            .{ .cwd_relative = b.pathJoin(&.{ cuda.prefix, "include", "cccl" }) },
             .{ .cwd_relative = cuda.cudnn_include },
         }) catch @panic("OOM");
         if (b.lazyDependency("cudnn_frontend", .{})) |dep| {
@@ -1093,8 +1453,13 @@ const Parts = struct {
 
         const arch = b.fmt("-gencode=arch=compute_{s},code=sm_{s}", .{ cuda.arch, cuda.arch });
         var objects: std.ArrayList(std.Build.LazyPath) = .empty;
+        const cmd = cuda.compilerCommand(b);
+        const wrap = cuda.nixWrapStep(b);
         for (sources.ort_cuda_device_sources) |file| {
-            const run = b.addSystemCommand(&.{ cuda.compiler(b), "-ccbin", cuda.ccbin });
+            const run = b.addSystemCommand(cmd);
+            if (cuda.fetch) |fetch| run.step.dependOn(fetch);
+            run.step.dependOn(&wrap.step);
+            run.addArgs(&.{ "-ccbin", cuda.ccbin });
             run.addArgs(&.{ "-std=c++20", "-c", arch });
             run.addArgs(&nvcc_flags);
             run.addArgs(&cuda_defines);
@@ -1134,6 +1499,7 @@ const cuda_defines = [_][]const u8{
 
 /// nvcc's own switches, as opposed to the preprocessor defines above.
 const nvcc_flags = [_][]const u8{
+    "-allow-unsupported-compiler",
     // ORT calls plenty of constexpr host functions from device code and relies
     // on nvcc allowing it.
     "--expt-relaxed-constexpr",
@@ -1235,6 +1601,23 @@ const ort_flags = ort_base_flags ++ [_][]const u8{
 // over __builtin_acosf. GCC folds those at compile time; clang does not, and
 // rejects the definitions outright rather than warning.
 const ort_openvino_flags = ort_base_flags ++ [_][]const u8{
+    "-Wno-invalid-constexpr",
+};
+
+// Upstream ties RTTI to the CUDA provider rather than leaving it a free choice:
+//
+//   cmake_dependent_option(onnxruntime_DISABLE_RTTI "Disable RTTI" ON
+//       "NOT onnxruntime_ENABLE_PYTHON;NOT onnxruntime_USE_CUDA" OFF)
+//
+// cuda_kernel.h reaches a CudaStream through `dynamic_cast` in both
+// GetCudnnHandle and GetCublasHandle, so the provider cannot compile without
+// it. The pair comes off the whole build and not just off the provider because
+// ORT_NO_RTTI also changes the code the two sides compile from shared headers,
+// and they meet over vtables -- see the USE_CUDA_PROVIDER_INTERFACE note above.
+//
+// -Wno-invalid-constexpr for the same reason the OpenVINO set carries it: this
+// path compiles against the host libstdc++ that ccbin names.
+const ort_cuda_flags = ort_base_flags ++ [_][]const u8{
     "-Wno-invalid-constexpr",
 };
 

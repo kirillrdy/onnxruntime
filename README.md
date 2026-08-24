@@ -145,6 +145,49 @@ and the NPU driver (`libze_intel_npu.so.1`) on the library path. If only the
 loader is reachable the NPU still enumerates but every compile fails with `No
 available backend`.
 
+## NVIDIA CUDA (GPU)
+
+`-Ddevice=cuda` (or `-Dcuda-fetch`) builds the CUDA execution provider from source, downloading NVIDIA's CUDA 13.0 toolkit and cuDNN 9.14 redistributables into the build cache:
+
+```
+zig build -Ddevice=cuda
+```
+
+Alternatively, if you have a local CUDA installation:
+
+```
+zig build -Dcuda=/path/to/cuda
+```
+
+Consumers can select CUDA effortlessly using `select()`:
+
+```zig
+const onnxruntime = @import("onnxruntime");
+
+// Declares -Ddevice, -Dcuda, etc. Automatically downloads toolkit if needed:
+const ort = onnxruntime.select(b, target, optimize, .cuda);
+
+const exe = b.addExecutable(.{ ... });
+ort.addImport(exe.root_module);
+ort.linkExecutable(exe);
+_ = ort.installProvider();
+```
+
+### Options
+
+| Option | Default | Description |
+|---|---|---|
+| `-Ddevice=cuda` | `cpu` | Target execution provider |
+| `-Dcuda-fetch` | `false` | Explicitly download NVIDIA CUDA 13.0 & cuDNN 9.14 redistributables |
+| `-Dcuda=<prefix>` | `null` | Path to an existing local CUDA installation |
+| `-Dcuda-arch=<sm>` | `89` (Ada) | Target compute capability (`75`, `80`, `86`, `89`, `90`) |
+| `-Dcuda-ccbin=<c++>` | first supported g++ | Host C++ compiler for nvcc |
+
+The toolkit only drives a GCC its `crt/host_config.h` allows -- 15 and older for
+CUDA 13.0. `-Dcuda-ccbin` is otherwise worked out from `$CXX`, `c++`, `g++` and
+the versioned `g++-N` names, and the build stops at configuration if none of
+them fits, rather than deep inside libstdc++ once nvcc is already running.
+
 ## Version
 
 `.version` in `build.zig.zon` is the ONNX Runtime version. Moving to a new
