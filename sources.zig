@@ -1079,13 +1079,11 @@ pub const ort_providers_sources = [_][]const u8{
 
 pub const ort_mlas_sources = [_][]const u8{
     "core/mlas/lib/activate.cpp",
-    "core/mlas/lib/activate_fp16.cpp",
     "core/mlas/lib/cast.cpp",
     "core/mlas/lib/compute.cpp",
     "core/mlas/lib/convolve.cpp",
     "core/mlas/lib/convsym.cpp",
     "core/mlas/lib/dequantize.cpp",
-    "core/mlas/lib/dwconv.cpp",
     "core/mlas/lib/eltwise.cpp",
     "core/mlas/lib/erf.cpp",
     "core/mlas/lib/flashattn.cpp",
@@ -1098,7 +1096,6 @@ pub const ort_mlas_sources = [_][]const u8{
     "core/mlas/lib/logistic.cpp",
     "core/mlas/lib/platform.cpp",
     "core/mlas/lib/pooling.cpp",
-    "core/mlas/lib/pooling_fp16.cpp",
     "core/mlas/lib/q4_dq.cpp",
     "core/mlas/lib/q4gemm.cpp",
     "core/mlas/lib/qdwconv.cpp",
@@ -1127,7 +1124,10 @@ pub const ort_mlas_sources = [_][]const u8{
 };
 
 const ort_mlas_x86_64_sources = [_][]const u8{
+    "core/mlas/lib/activate_fp16.cpp",
     "core/mlas/lib/dgemm.cpp",
+    "core/mlas/lib/dwconv.cpp",
+    "core/mlas/lib/pooling_fp16.cpp",
     "core/mlas/lib/qgemm_kernel_avx2.cpp",
     "core/mlas/lib/x86_64/QgemmU8S8KernelAmxCommon.S",
 };
@@ -1303,6 +1303,19 @@ const ort_mlas_x86_64_groups = [_]MlasGroup{
 };
 
 const ort_mlas_aarch64_groups = [_]MlasGroup{
+    .{
+        // All three reach for fp16 NEON arithmetic unconditionally, which a
+        // plain v8-a baseline does not assemble -- upstream compiles exactly
+        // these with -march=armv8.2-a+fp16. The kernels stay behind
+        // MlasFp16AccelerationSupported, so a machine without fp16 never
+        // reaches them.
+        .features = arm(&.{.fullfp16}),
+        .files = &.{
+            "core/mlas/lib/activate_fp16.cpp",
+            "core/mlas/lib/dwconv.cpp",
+            "core/mlas/lib/pooling_fp16.cpp",
+        },
+    },
     .{
         .features = arm(&.{.dotprod}),
         .files = &.{
