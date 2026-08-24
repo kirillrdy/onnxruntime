@@ -185,18 +185,62 @@ pub const FileFlags = struct {
     flags: []const []const u8,
 };
 
-// Sources needing flags of their own. Zig's addCSourceFiles appends rather
-// than overrides, so a file listed here must NOT also appear in a list above:
-// both objects would land in the archive and the linker would resolve against
-// the first one added, silently discarding the flags.
-pub fn ortFileFlags(target: std.Target) []const FileFlags {
-    if (target.cpu.arch == .x86_64) {
-        return &.{
-            .{ .file = "core/common/spin_pause.cc", .flags = &.{"-mwaitpkg"} },
-        };
-    }
-    return &.{
-        .{ .file = "core/common/spin_pause.cc", .flags = &.{} },
+const spin_pause_file = "core/common/spin_pause.cc";
+const spin_pause_waitpkg = [_]FileFlags{.{ .file = spin_pause_file, .flags = &.{"-mwaitpkg"} }};
+const spin_pause_plain = [_]FileFlags{.{ .file = spin_pause_file, .flags = &.{} }};
+
+/// Every list whose contents depend on the machine being built for. One switch,
+/// so an architecture is either described here in full or rejected outright.
+pub const TargetSources = struct {
+    cpuinfo: []const []const u8,
+    /// The mlas sources written for this architecture, on top of
+    /// `ort_mlas_sources`.
+    mlas: []const []const u8,
+    /// mlas translation units compiled against a raised ISA baseline.
+    mlas_groups: []const MlasGroup,
+    device_discovery: []const []const u8,
+    /// Sources needing flags of their own. Zig's addCSourceFiles appends rather
+    /// than overrides, so a file listed here must NOT also appear in a list
+    /// elsewhere in this file: both objects would land in the archive and the
+    /// linker would resolve against the first one added, silently discarding
+    /// the flags.
+    file_flags: []const FileFlags,
+};
+
+pub fn forTarget(target: std.Target) TargetSources {
+    const is_darwin = target.os.tag.isDarwin();
+    const device_discovery: []const []const u8 = if (is_darwin)
+        &apple_device_discovery_sources
+    else if (target.os.tag == .linux)
+        &linux_device_discovery_sources
+    else
+        &default_device_discovery_sources;
+
+    return switch (target.cpu.arch) {
+        .x86_64 => .{
+            .cpuinfo = if (is_darwin)
+                &(cpuinfo_sources ++ cpuinfo_x86_sources ++ cpuinfo_x86_mach_sources ++ cpuinfo_mach_sources)
+            else
+                &(cpuinfo_sources ++ cpuinfo_x86_sources ++ cpuinfo_x86_linux_sources ++ cpuinfo_linux_sources),
+            .mlas = &ort_mlas_x86_64_sources,
+            .mlas_groups = &ort_mlas_x86_64_groups,
+            .device_discovery = device_discovery,
+            // spin_pause.cc reaches for umonitor/umwait, which only assemble
+            // with -mwaitpkg; the instructions themselves stay behind a
+            // runtime check.
+            .file_flags = &spin_pause_waitpkg,
+        },
+        .aarch64 => .{
+            .cpuinfo = if (is_darwin)
+                &(cpuinfo_sources ++ cpuinfo_arm_sources ++ cpuinfo_arm_mach_sources ++ cpuinfo_mach_sources)
+            else
+                &(cpuinfo_sources ++ cpuinfo_arm_sources ++ cpuinfo_arm_linux_sources ++ cpuinfo_linux_sources),
+            .mlas = &ort_mlas_aarch64_sources,
+            .mlas_groups = &ort_mlas_aarch64_groups,
+            .device_discovery = device_discovery,
+            .file_flags = &spin_pause_plain,
+        },
+        else => std.debug.panic("unsupported architecture: {s}", .{@tagName(target.cpu.arch)}),
     };
 }
 
@@ -415,14 +459,14 @@ pub const re2_sources = [_][]const u8{
     "util/rune.cc",
     "util/strutil.cc",
 };
-pub const cpuinfo_sources = [_][]const u8{
+const cpuinfo_sources = [_][]const u8{
     "src/api.c",
     "src/cache.c",
     "src/init.c",
     "src/log.c",
 };
 
-pub const cpuinfo_x86_sources = [_][]const u8{
+const cpuinfo_x86_sources = [_][]const u8{
     "src/x86/cache/descriptor.c",
     "src/x86/cache/deterministic.c",
     "src/x86/cache/init.c",
@@ -435,21 +479,21 @@ pub const cpuinfo_x86_sources = [_][]const u8{
     "src/x86/vendor.c",
 };
 
-pub const cpuinfo_x86_linux_sources = [_][]const u8{
+const cpuinfo_x86_linux_sources = [_][]const u8{
     "src/x86/linux/cpuinfo.c",
     "src/x86/linux/init.c",
 };
 
-pub const cpuinfo_x86_mach_sources = [_][]const u8{
+const cpuinfo_x86_mach_sources = [_][]const u8{
     "src/x86/mach/init.c",
 };
 
-pub const cpuinfo_arm_sources = [_][]const u8{
+const cpuinfo_arm_sources = [_][]const u8{
     "src/arm/cache.c",
     "src/arm/uarch.c",
 };
 
-pub const cpuinfo_arm_linux_sources = [_][]const u8{
+const cpuinfo_arm_linux_sources = [_][]const u8{
     "src/arm/linux/aarch64-isa.c",
     "src/arm/linux/chipset.c",
     "src/arm/linux/clusters.c",
@@ -459,41 +503,24 @@ pub const cpuinfo_arm_linux_sources = [_][]const u8{
     "src/arm/linux/midr.c",
 };
 
-pub const cpuinfo_arm_mach_sources = [_][]const u8{
+const cpuinfo_arm_mach_sources = [_][]const u8{
     "src/arm/mach/init.c",
 };
 
-pub const cpuinfo_mach_sources = [_][]const u8{
+const cpuinfo_mach_sources = [_][]const u8{
     "src/mach/topology.c",
 };
 
-pub const cpuinfo_linux_sources = [_][]const u8{
+const cpuinfo_linux_sources = [_][]const u8{
     "src/linux/cpulist.c",
     "src/linux/multiline.c",
     "src/linux/processors.c",
     "src/linux/smallfile.c",
 };
 
-pub fn cpuinfoSources(target: std.Target) []const []const []const u8 {
-    const is_darwin = target.os.tag.isDarwin();
-    return switch (target.cpu.arch) {
-        .x86_64 => if (is_darwin)
-            &.{ &cpuinfo_sources, &cpuinfo_x86_sources, &cpuinfo_x86_mach_sources, &cpuinfo_mach_sources }
-        else
-            &.{ &cpuinfo_sources, &cpuinfo_x86_sources, &cpuinfo_x86_linux_sources, &cpuinfo_linux_sources },
-        .aarch64 => if (is_darwin)
-            &.{ &cpuinfo_sources, &cpuinfo_arm_sources, &cpuinfo_arm_mach_sources, &cpuinfo_mach_sources }
-        else
-            &.{ &cpuinfo_sources, &cpuinfo_arm_sources, &cpuinfo_arm_linux_sources, &cpuinfo_linux_sources },
-        else => @panic("unsupported architecture for cpuinfo"),
-    };
-}
-
-pub fn platformDeviceDiscoverySource(target: std.Target) []const u8 {
-    if (target.os.tag.isDarwin()) return "core/platform/apple/device_discovery.cc";
-    if (target.os.tag == .linux) return "core/platform/linux/device_discovery.cc";
-    return "core/platform/device_discovery_default.cc";
-}
+const apple_device_discovery_sources = [_][]const u8{"core/platform/apple/device_discovery.cc"};
+const linux_device_discovery_sources = [_][]const u8{"core/platform/linux/device_discovery.cc"};
+const default_device_discovery_sources = [_][]const u8{"core/platform/device_discovery_default.cc"};
 
 pub const ort_common_sources = [_][]const u8{
     "core/common/cpuid_info.cc",
@@ -1099,62 +1126,72 @@ pub const ort_mlas_sources = [_][]const u8{
     "core/mlas/lib/transpose.cpp",
 };
 
-pub const ort_mlas_x86_64_sources = [_][]const u8{
+const ort_mlas_x86_64_sources = [_][]const u8{
     "core/mlas/lib/dgemm.cpp",
     "core/mlas/lib/qgemm_kernel_avx2.cpp",
     "core/mlas/lib/x86_64/QgemmU8S8KernelAmxCommon.S",
 };
 
-pub const ort_mlas_aarch64_sources = [_][]const u8{
+const ort_mlas_aarch64_sources = [_][]const u8{
     "core/mlas/lib/aarch64/ConvSymS8KernelDot.S",
     "core/mlas/lib/aarch64/ConvSymS8KernelDotLd64.S",
-    "core/mlas/lib/aarch64/ConvSymU8KernelDot.S",
     "core/mlas/lib/aarch64/ConvSymS8KernelNeon.S",
+    "core/mlas/lib/aarch64/ConvSymU8KernelDot.S",
     "core/mlas/lib/aarch64/ConvSymU8KernelNeon.S",
+    "core/mlas/lib/aarch64/DepthwiseQConvKernelSize9Neon.S",
     "core/mlas/lib/aarch64/DepthwiseQConvSymS8KernelNeon.S",
     "core/mlas/lib/aarch64/DepthwiseQConvSymU8KernelNeon.S",
-    "core/mlas/lib/aarch64/DepthwiseQConvKernelSize9Neon.S",
-    "core/mlas/lib/aarch64/QgemmU8X8KernelNeon.S",
     "core/mlas/lib/aarch64/QgemmS8S8KernelNeon.S",
-    "core/mlas/lib/aarch64/QgemmU8X8KernelUdot.S",
     "core/mlas/lib/aarch64/QgemmS8S8KernelSdot.S",
+    "core/mlas/lib/aarch64/QgemmU8X8KernelNeon.S",
+    "core/mlas/lib/aarch64/QgemmU8X8KernelUdot.S",
     "core/mlas/lib/aarch64/SgemmKernelNeon.S",
     "core/mlas/lib/aarch64/SgemvKernelNeon.S",
     "core/mlas/lib/aarch64/SymQgemmS8KernelNeon.S",
     "core/mlas/lib/aarch64/SymQgemmS8KernelSdot.S",
     "core/mlas/lib/aarch64/SymQgemmS8KernelSdotLd64.S",
-    "core/mlas/lib/qgemm_kernel_neon.cpp",
-    "core/mlas/lib/qgemm_kernel_udot.cpp",
-    "core/mlas/lib/qgemm_kernel_sdot.cpp",
-    "core/mlas/lib/qnbitgemm_kernel_neon.cpp",
-    "core/mlas/lib/sqnbitgemm_kernel_neon_fp32.cpp",
-    "core/mlas/lib/rotary_embedding_kernel_neon.cpp",
-    "core/mlas/lib/qkv_quant_kernel_neon.cpp",
-    "core/mlas/lib/hgemm_kernel_neon.cpp",
-    "core/mlas/lib/softmax_kernel_neon.cpp",
     "core/mlas/lib/eltwise_kernel_neon.cpp",
+    "core/mlas/lib/hgemm_kernel_neon.cpp",
+    "core/mlas/lib/qgemm_kernel_neon.cpp",
+    "core/mlas/lib/qgemm_kernel_sdot.cpp",
+    "core/mlas/lib/qgemm_kernel_udot.cpp",
+    "core/mlas/lib/qkv_quant_kernel_neon.cpp",
+    "core/mlas/lib/qnbitgemm_kernel_neon.cpp",
+    "core/mlas/lib/rotary_embedding_kernel_neon.cpp",
     "core/mlas/lib/sconv_nchw_depthwise_multiplier_1.cpp",
+    "core/mlas/lib/softmax_kernel_neon.cpp",
+    "core/mlas/lib/sqnbitgemm_kernel_neon_fp32.cpp",
 };
 
-pub fn ortMlasArchSources(arch: std.Target.Cpu.Arch) []const []const u8 {
-    return switch (arch) {
-        .x86_64 => &ort_mlas_x86_64_sources,
-        .aarch64 => &ort_mlas_aarch64_sources,
-        else => @panic("unsupported architecture for mlas"),
-    };
+/// Lowers an architecture's own feature enum to the untyped set `MlasGroup`
+/// carries, so that groups for either architecture share the one type.
+fn featureSet(comptime Feature: type, comptime features: []const Feature) std.Target.Cpu.Feature.Set {
+    comptime {
+        var set: std.Target.Cpu.Feature.Set = .empty;
+        for (features) |feature| set.addFeature(@intFromEnum(feature));
+        return set;
+    }
+}
+
+fn x86(comptime features: []const std.Target.x86.Feature) std.Target.Cpu.Feature.Set {
+    return featureSet(std.Target.x86.Feature, features);
+}
+
+fn arm(comptime features: []const std.Target.aarch64.Feature) std.Target.Cpu.Feature.Set {
+    return featureSet(std.Target.aarch64.Feature, features);
 }
 
 pub const MlasGroup = struct {
-    features: []const usize,
+    /// The ISA baseline these files are compiled against, on top of the
+    /// target's own.
+    features: std.Target.Cpu.Feature.Set,
     files: []const []const u8,
     flags: []const []const u8 = &.{},
 };
 
-pub const ort_mlas_x86_64_groups = [_]MlasGroup{
+const ort_mlas_x86_64_groups = [_]MlasGroup{
     .{
-        .features = &.{
-            @intFromEnum(std.Target.x86.Feature.avx),
-        },
+        .features = x86(&.{.avx}),
         .files = &.{
             "core/mlas/lib/intrinsics/avx/min_max_elements.cpp",
             "core/mlas/lib/x86_64/DgemmKernelAvx.S",
@@ -1168,24 +1205,14 @@ pub const ort_mlas_x86_64_groups = [_]MlasGroup{
         },
     },
     .{
-        .features = &.{
-            @intFromEnum(std.Target.x86.Feature.avx2),
-            @intFromEnum(std.Target.x86.Feature.avx512bw),
-            @intFromEnum(std.Target.x86.Feature.avx512dq),
-            @intFromEnum(std.Target.x86.Feature.avx512f),
-            @intFromEnum(std.Target.x86.Feature.avx512vl),
-        },
+        .features = x86(&.{ .avx2, .avx512bw, .avx512dq, .avx512f, .avx512vl }),
         .files = &.{
             "core/mlas/lib/qgemm_kernel_amx.cpp",
             "core/mlas/lib/x86_64/QgemmU8S8KernelAmx.S",
         },
     },
     .{
-        .features = &.{
-            @intFromEnum(std.Target.x86.Feature.avx2),
-            @intFromEnum(std.Target.x86.Feature.f16c),
-            @intFromEnum(std.Target.x86.Feature.fma),
-        },
+        .features = x86(&.{ .avx2, .f16c, .fma }),
         .files = &.{
             "core/mlas/lib/intrinsics/avx2/qdwconv_avx2.cpp",
             "core/mlas/lib/intrinsics/avx2/qladd_avx2.cpp",
@@ -1213,11 +1240,7 @@ pub const ort_mlas_x86_64_groups = [_]MlasGroup{
     .{
         // The 2-bit dequant kernel keeps its multiply and add apart to stay
         // bit-identical to the scalar kernel, so contraction is turned off.
-        .features = &.{
-            @intFromEnum(std.Target.x86.Feature.avx2),
-            @intFromEnum(std.Target.x86.Feature.f16c),
-            @intFromEnum(std.Target.x86.Feature.fma),
-        },
+        .features = x86(&.{ .avx2, .f16c, .fma }),
         .files = &.{
             "core/mlas/lib/intrinsics/avx2/q2_dq_avx2.cpp",
         },
@@ -1226,20 +1249,13 @@ pub const ort_mlas_x86_64_groups = [_]MlasGroup{
     .{
         // AVX-VNNI lives in a translation unit of its own so the vectorizer
         // cannot slip a VNNI instruction into the plain AVX2 kernels.
-        .features = &.{
-            @intFromEnum(std.Target.x86.Feature.avx2),
-            @intFromEnum(std.Target.x86.Feature.avxvnni),
-            @intFromEnum(std.Target.x86.Feature.f16c),
-            @intFromEnum(std.Target.x86.Feature.fma),
-        },
+        .features = x86(&.{ .avx2, .avxvnni, .f16c, .fma }),
         .files = &.{
             "core/mlas/lib/sqnbitgemm_kernel_avx2vnni.cpp",
         },
     },
     .{
-        .features = &.{
-            @intFromEnum(std.Target.x86.Feature.avx512f),
-        },
+        .features = x86(&.{.avx512f}),
         .files = &.{
             "core/mlas/lib/intrinsics/avx512/gelu_avx512f.cpp",
             "core/mlas/lib/intrinsics/avx512/quantize_avx512f.cpp",
@@ -1254,13 +1270,7 @@ pub const ort_mlas_x86_64_groups = [_]MlasGroup{
         },
     },
     .{
-        .features = &.{
-            @intFromEnum(std.Target.x86.Feature.avx512bw),
-            @intFromEnum(std.Target.x86.Feature.avx512dq),
-            @intFromEnum(std.Target.x86.Feature.avx512vl),
-            @intFromEnum(std.Target.x86.Feature.avx512vnni),
-            @intFromEnum(std.Target.x86.Feature.fma),
-        },
+        .features = x86(&.{ .avx512bw, .avx512dq, .avx512vl, .avx512vnni, .fma }),
         .files = &.{
             "core/mlas/lib/sqnbitgemm_kernel_avx512.cpp",
             "core/mlas/lib/x86_64/ConvSymKernelAvx512Core.S",
@@ -1270,15 +1280,7 @@ pub const ort_mlas_x86_64_groups = [_]MlasGroup{
         },
     },
     .{
-        .features = &.{
-            @intFromEnum(std.Target.x86.Feature.avx512bw),
-            @intFromEnum(std.Target.x86.Feature.avx512dq),
-            @intFromEnum(std.Target.x86.Feature.avx512f),
-            @intFromEnum(std.Target.x86.Feature.avx512vl),
-            @intFromEnum(std.Target.x86.Feature.avx512vnni),
-            @intFromEnum(std.Target.x86.Feature.f16c),
-            @intFromEnum(std.Target.x86.Feature.fma),
-        },
+        .features = x86(&.{ .avx512bw, .avx512dq, .avx512f, .avx512vl, .avx512vnni, .f16c, .fma }),
         .files = &.{
             "core/mlas/lib/q4gemm_avx512.cpp",
             "core/mlas/lib/qkv_quant_kernel_avx512vnni.cpp",
@@ -1287,9 +1289,7 @@ pub const ort_mlas_x86_64_groups = [_]MlasGroup{
         },
     },
     .{
-        .features = &.{
-            @intFromEnum(std.Target.x86.Feature.sse2),
-        },
+        .features = x86(&.{.sse2}),
         .files = &.{
             "core/mlas/lib/qgemm_kernel_sse.cpp",
             "core/mlas/lib/x86_64/cvtfp16a.S",
@@ -1302,33 +1302,21 @@ pub const ort_mlas_x86_64_groups = [_]MlasGroup{
     },
 };
 
-pub const ort_mlas_aarch64_groups = [_]MlasGroup{
+const ort_mlas_aarch64_groups = [_]MlasGroup{
     .{
-        .features = &.{
-            @intFromEnum(std.Target.aarch64.Feature.dotprod),
-        },
+        .features = arm(&.{.dotprod}),
         .files = &.{
             "core/mlas/lib/sqnbitgemm_kernel_neon_int8.cpp",
             "core/mlas/lib/sqnbitgemm_kernel_neon_int8_2bit.cpp",
         },
     },
     .{
-        .features = &.{
-            @intFromEnum(std.Target.aarch64.Feature.i8mm),
-        },
+        .features = arm(&.{.i8mm}),
         .files = &.{
             "core/mlas/lib/sqnbitgemm_kernel_neon_int8_i8mm.cpp",
         },
     },
 };
-
-pub fn ortMlasGroups(arch: std.Target.Cpu.Arch) []const MlasGroup {
-    return switch (arch) {
-        .x86_64 => &ort_mlas_x86_64_groups,
-        .aarch64 => &ort_mlas_aarch64_groups,
-        else => @panic("unsupported architecture for mlas groups"),
-    };
-}
 
 // The OpenVINO execution provider, ORT's only route to an Intel NPU. These
 // go into a shared library of their own rather than into libonnxruntime.a:

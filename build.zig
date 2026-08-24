@@ -189,11 +189,11 @@ fn fetchStep(b: *std.Build) *std.Build.Step.Run {
     const run = b.addRunArtifact(fetch_exe);
     run.has_side_effects = true;
     run.addArgs(&.{
-        "--url",           openvino_url,
-        "--out",           archive,
-        "--sha256",        openvino_sha256,
-        "--extract",       openvinoRoot(b),
-        "--label",         "OpenVINO " ++ openvino_version ++ " (111 MiB)",
+        "--url",     openvino_url,
+        "--out",     archive,
+        "--sha256",  openvino_sha256,
+        "--extract", openvinoRoot(b),
+        "--label",   "OpenVINO " ++ openvino_version ++ " (111 MiB)",
     });
 
     const step = b.step("fetch-openvino", "Download Intel's OpenVINO release, for -Dopenvino-fetch");
@@ -291,6 +291,8 @@ const Parts = struct {
     cpuinfo: *std.Build.Dependency,
     protos: std.Build.LazyPath,
     includes: []const std.Build.LazyPath,
+    /// Flags for every C++ translation unit in the build.
+    flags: []const []const u8,
 
     fn init(
         b: *std.Build,
@@ -339,6 +341,15 @@ const Parts = struct {
             b.dependency("json", .{}).path("single_include"),
         }) catch @panic("OOM");
 
+        // -gline-tables-only: full DWARF for a build this size overruns what
+        // Mach-O's debug map can address, and the line tables are all the
+        // symbolicated backtraces here need.
+        const cxx_base = if (openvino == null) &ort_flags else &ort_openvino_flags;
+        const cxx_flags = if (target.result.os.tag.isDarwin())
+            concatFlags(b, &.{ cxx_base, &.{"-gline-tables-only"} })
+        else
+            cxx_base;
+
         return .{
             .b = b,
             .target = target,
@@ -353,6 +364,7 @@ const Parts = struct {
             .cpuinfo = cpuinfo,
             .protos = protos,
             .includes = includes,
+            .flags = cxx_flags,
         };
     }
 
@@ -385,39 +397,28 @@ const Parts = struct {
         if (self.gnu) |gnu| gnu.link(mod);
     }
 
-    /// Flags for every C++ translation unit in the build.
-    fn flags(self: Parts) []const []const u8 {
-        const base = if (self.openvino == null) &ort_flags else &ort_openvino_flags;
-        if (self.target.result.os.tag.isDarwin()) {
-            return concatFlags(self.b, &.{ base, &.{"-gline-tables-only"} });
-        }
-        return base;
-    }
-
     fn runtime(self: Parts) *std.Build.Step.Compile {
         const b = self.b;
-        const ort_flags_ = self.flags();
         const ort_root = self.ort.path("onnxruntime");
+        const target_sources = sources.forTarget(self.target.result);
 
         const lib_mod = self.cxxModule(self.target);
         lib_mod.addIncludePath(self.protos);
 
-        lib_mod.addCSourceFiles(.{ .root = self.protos, .files = &sources.onnx_proto_sources, .flags = ort_flags_ });
+        lib_mod.addCSourceFiles(.{ .root = self.protos, .files = &sources.onnx_proto_sources, .flags = self.flags });
         lib_mod.addCSourceFiles(.{
             .root = self.onnx.path(""),
             .files = &sources.onnx_sources,
-            .flags = concatFlags(b, &.{ ort_flags_, &.{"-D__ONNX_DISABLE_STATIC_REGISTRATION"} }),
+            .flags = concatFlags(b, &.{ self.flags, &.{"-D__ONNX_DISABLE_STATIC_REGISTRATION"} }),
         });
-        lib_mod.addCSourceFiles(.{ .root = self.abseil.path(""), .files = &sources.abseil_sources, .flags = ort_flags_ });
-        lib_mod.addCSourceFiles(.{ .root = self.re2.path(""), .files = &sources.re2_sources, .flags = ort_flags_ });
-        lib_mod.addCSourceFiles(.{ .root = self.protobuf.path(""), .files = &sources.protobuf_lite_sources, .flags = ort_flags_ });
-        for (sources.cpuinfoSources(self.target.result)) |list| {
-            lib_mod.addCSourceFiles(.{ .root = self.cpuinfo.path(""), .files = list, .flags = &ort_c_flags });
-        }
+        lib_mod.addCSourceFiles(.{ .root = self.abseil.path(""), .files = &sources.abseil_sources, .flags = self.flags });
+        lib_mod.addCSourceFiles(.{ .root = self.re2.path(""), .files = &sources.re2_sources, .flags = self.flags });
+        lib_mod.addCSourceFiles(.{ .root = self.protobuf.path(""), .files = &sources.protobuf_lite_sources, .flags = self.flags });
+        lib_mod.addCSourceFiles(.{ .root = self.cpuinfo.path(""), .files = target_sources.cpuinfo, .flags = &ort_c_flags });
         lib_mod.addCSourceFiles(.{
             .root = self.ort.path("model_package"),
             .files = &sources.model_package_sources,
-            .flags = ort_flags_,
+            .flags = self.flags,
         });
 
         for ([_][]const []const u8{
@@ -431,20 +432,16 @@ const Parts = struct {
             &sources.ort_lora_sources,
             &sources.ort_flatbuffers_sources,
             &sources.ort_mlas_sources,
-            sources.ortMlasArchSources(self.target.result.cpu.arch),
+            target_sources.mlas,
+            target_sources.device_discovery,
         }) |list| {
-            lib_mod.addCSourceFiles(.{ .root = ort_root, .files = list, .flags = ort_flags_ });
+            lib_mod.addCSourceFiles(.{ .root = ort_root, .files = list, .flags = self.flags });
         }
-        lib_mod.addCSourceFiles(.{
-            .root = ort_root,
-            .files = &.{sources.platformDeviceDiscoverySource(self.target.result)},
-            .flags = ort_flags_,
-        });
-        for (sources.ortFileFlags(self.target.result)) |override| {
+        for (target_sources.file_flags) |override| {
             lib_mod.addCSourceFiles(.{
                 .root = ort_root,
                 .files = &.{override.file},
-                .flags = concatFlags(b, &.{ ort_flags_, override.flags }),
+                .flags = concatFlags(b, &.{ self.flags, override.flags }),
             });
         }
 
@@ -454,15 +451,15 @@ const Parts = struct {
             .root_module = lib_mod,
         });
 
-        for (sources.ortMlasGroups(self.target.result.cpu.arch), 0..) |group, index| {
+        for (target_sources.mlas_groups, 0..) |group, index| {
             var query = self.target.query;
-            for (group.features) |feature| query.cpu_features_add.addFeature(@intCast(feature));
+            query.cpu_features_add.addFeatureSet(group.features);
 
             const group_mod = self.cxxModule(b.resolveTargetQuery(query));
             group_mod.addCSourceFiles(.{
                 .root = ort_root,
                 .files = group.files,
-                .flags = concatFlags(b, &.{ ort_flags_, &mlas_group_flags, group.flags }),
+                .flags = concatFlags(b, &.{ self.flags, &mlas_group_flags, group.flags }),
             });
             lib.root_module.linkLibrary(b.addLibrary(.{
                 .name = b.fmt("onnxruntime-mlas-{d}", .{index}),
@@ -495,7 +492,7 @@ const Parts = struct {
         mod.addCSourceFiles(.{
             .root = self.ort.path("onnxruntime"),
             .files = &sources.ort_provider_host_sources,
-            .flags = self.flags(),
+            .flags = self.flags,
         });
         self.linkCxx(mod);
         const shared = b.addLibrary(.{
@@ -523,7 +520,7 @@ const Parts = struct {
         mod.addIncludePath(.{ .cwd_relative = openvino.include });
 
         const flags_ = concatFlags(b, &.{
-            self.flags(),
+            self.flags,
             &.{
                 // OpenVINO 2024.4 and up let the provider allocate NPU-visible
                 // memory itself rather than copying into it.
