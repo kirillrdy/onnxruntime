@@ -58,10 +58,10 @@ rest at run time while the rest of the library stays at the target's baseline.
 The first build compiles a few thousand C++ translation units and takes a
 while. Later builds come out of the Zig cache.
 
-## Intel NPU
+## Intel NPU and GPU
 
 `-Dopenvino=<prefix>` additionally builds the OpenVINO execution provider,
-which is how ONNX Runtime reaches an Intel NPU:
+which is how ONNX Runtime reaches an Intel NPU or iGPU:
 
 ```
 zig build -Dopenvino=/path/to/openvino
@@ -89,6 +89,9 @@ b.getInstallStep().dependOn(&b.addInstallArtifact(
     ort.artifact("onnxruntime_providers_shared"),
     .{ .dest_dir = .{ .override = .bin } },
 ).step);
+
+// A GPU additionally needs the OpenCL ICD loader built by this package.
+b.installArtifact(ort.artifact("OpenCL"));
 ```
 
 `libonnxruntime_providers_shared.so` is one global pointer and nothing else.
@@ -144,6 +147,26 @@ At run time the NPU plugin needs the Level Zero loader (`libze_loader.so.1`)
 and the NPU driver (`libze_intel_npu.so.1`) on the library path. If only the
 loader is reachable the NPU still enumerates but every compile fails with `No
 available backend`.
+
+The package also owns the run-time discovery for those device stacks. Pass
+directories explicitly supplied by the user as `extra`, and paths created by
+the build itself as `known`:
+
+```zig
+onnxruntime.addOpenVinoRuntimeEnvironment(
+    b,
+    run,
+    .gpu,
+    device_library_path,
+    runtime_paths,
+    opencl_driver_path,
+);
+```
+
+For the GPU this sets `OCL_ICD_FILENAMES` when no `.icd` registry entry exists,
+and finds Intel's `libigdrcl.so` under the same roots used for the NPU stack.
+For the NPU it adds any discovered Level Zero loader and driver directories to
+`LD_LIBRARY_PATH`. `known` paths are added unconditionally in either case.
 
 ## Version
 

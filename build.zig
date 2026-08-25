@@ -22,9 +22,10 @@
 //! It also builds an OpenCL ICD loader, because the GPU plugin inside that
 //! OpenVINO has `libOpenCL.so.1` in its `DT_NEEDED` and not every distribution
 //! packages one. A consumer that wants the GPU installs it beside the provider
-//! and puts that directory on the library path:
+//! and lets `addOpenVinoRuntimeEnvironment` make the device stack reachable:
 //!
 //!     b.installArtifact(ort.artifact("OpenCL"));
+//!     onnxruntime.addOpenVinoRuntimeEnvironment(b, run, .gpu, extra, known, null);
 //!
 //! Nothing links it, so a consumer that only wants the NPU can leave the
 //! artifact alone and it is never built. See `openclLoader`.
@@ -183,6 +184,124 @@ pub fn openvinoRuntimeLibraryPaths(b: *std.Build) []const []const u8 {
     paths[0] = b.pathJoin(&.{ root, "runtime", "lib", "intel64" });
     paths[1] = b.pathJoin(&.{ root, "runtime", "3rdparty", "tbb", "lib" });
     return paths;
+}
+
+/// The device an OpenVINO execution provider run is meant to reach.
+pub const OpenVinoDevice = enum {
+    npu,
+    gpu,
+    cpu,
+
+    /// Libraries the device's plugin stack dlopens by name.
+    ///
+    /// The GPU's loader is an artifact of this package and its driver is named
+    /// by path, while the CPU has no external stack at all.
+    fn libraries(self: OpenVinoDevice) []const []const u8 {
+        return switch (self) {
+            .npu => &.{ "libze_loader.so.1", "libze_intel_npu.so.1" },
+            .gpu => &.{},
+            .cpu => &.{},
+        };
+    }
+};
+
+/// Give a run step the environment needed by an OpenVINO device stack.
+///
+/// `extra` is a caller-supplied list of directories to search first. `known`
+/// contains directories the build created itself, such as the downloaded
+/// OpenVINO runtime and the install directory holding the OpenCL loader; these
+/// are put on the library path without probing them during build graph setup.
+/// `opencl_driver_path` can name one exact GPU driver, otherwise the system ICD
+/// registry and common library roots are inspected.
+pub fn addOpenVinoRuntimeEnvironment(
+    b: *std.Build,
+    run: *std.Build.Step.Run,
+    device: OpenVinoDevice,
+    extra: []const []const u8,
+    known: []const []const u8,
+    opencl_driver_path: ?[]const u8,
+) void {
+    if (device == .gpu) {
+        const driver = opencl_driver_path orelse findOpenclDriver(b, extra);
+        if (driver) |path| run.setEnvironmentVariable("OCL_ICD_FILENAMES", path);
+    }
+
+    var dirs: std.ArrayList([]const u8) = .empty;
+    defer dirs.deinit(b.allocator);
+    dirs.appendSlice(b.allocator, known) catch @panic("OOM");
+
+    for (device.libraries()) |library_name| {
+        var found = false;
+        for (extra) |dir| found = found or hasLibrary(b, dir, library_name);
+        if (found) continue;
+        for (device_library_dirs) |dir| {
+            if (!hasLibrary(b, dir, library_name)) continue;
+            for (dirs.items) |seen| {
+                if (std.mem.eql(u8, seen, dir)) break;
+            } else dirs.append(b.allocator, dir) catch @panic("OOM");
+            break;
+        }
+    }
+
+    var path: std.ArrayList(u8) = .empty;
+    defer path.deinit(b.allocator);
+
+    if (run.getEnvMap().get("LD_LIBRARY_PATH")) |inherited| {
+        if (inherited.len != 0) path.appendSlice(b.allocator, inherited) catch @panic("OOM");
+    }
+    for ([_][]const []const u8{ extra, dirs.items }) |list| {
+        for (list) |dir| {
+            if (path.items.len != 0) path.append(b.allocator, ':') catch @panic("OOM");
+            path.appendSlice(b.allocator, dir) catch @panic("OOM");
+        }
+    }
+    if (path.items.len != 0) run.setEnvironmentVariable("LD_LIBRARY_PATH", path.items);
+}
+
+/// Common roots for device libraries. The NPU loader and driver may be in
+/// different roots on NixOS, while ordinary distributions usually put both on
+/// the default dynamic-loader path.
+const device_library_dirs = [_][]const u8{
+    "/run/opengl-driver/lib",
+    "/run/current-system/sw/lib",
+    "/usr/lib/x86_64-linux-gnu",
+    "/usr/lib64",
+    "/usr/lib",
+};
+
+const opencl_driver = "libigdrcl.so";
+const opencl_driver_subdir = "intel-opencl";
+
+fn findOpenclDriver(b: *std.Build, extra: []const []const u8) ?[]const u8 {
+    if (hasIcdRegistry(b)) return null;
+
+    for ([_][]const []const u8{ extra, &device_library_dirs }) |list| {
+        for (list) |root| {
+            for ([_][]const u8{ b.pathJoin(&.{ root, opencl_driver_subdir }), root }) |dir| {
+                if (hasLibrary(b, dir, opencl_driver)) return b.pathJoin(&.{ dir, opencl_driver });
+            }
+        }
+    }
+    return null;
+}
+
+fn hasLibrary(b: *std.Build, dir: []const u8, library_name: []const u8) bool {
+    const path = b.pathJoin(&.{ dir, library_name });
+    std.Io.Dir.accessAbsolute(b.graph.io, path, .{}) catch return false;
+    return true;
+}
+
+fn hasIcdRegistry(b: *std.Build) bool {
+    var dir = std.Io.Dir.openDirAbsolute(b.graph.io, "/etc/OpenCL/vendors", .{
+        .iterate = true,
+    }) catch return false;
+    defer dir.close(b.graph.io);
+
+    var it = dir.iterate();
+    while (it.next(b.graph.io) catch return false) |entry| {
+        if (std.mem.endsWith(u8, entry.name, ".icd")) return true;
+    }
+    return false;
 }
 
 /// `zig build fetch-openvino`, and the step the provider hangs off.
