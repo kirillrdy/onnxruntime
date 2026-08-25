@@ -16,8 +16,18 @@
 //! "onnxruntime_c_api.h" then works with no include path of your own.
 //!
 //! `-Dopenvino=<prefix>` additionally builds the OpenVINO execution provider,
-//! which is how ONNX Runtime reaches an Intel NPU. That build links a system
-//! OpenVINO and so gives up the properties above; see `OpenVino`.
+//! which is how ONNX Runtime reaches an Intel NPU or iGPU. That build links a
+//! system OpenVINO and so gives up the properties above; see `OpenVino`.
+//!
+//! It also builds an OpenCL ICD loader, because the GPU plugin inside that
+//! OpenVINO has `libOpenCL.so.1` in its `DT_NEEDED` and not every distribution
+//! packages one. A consumer that wants the GPU installs it beside the provider
+//! and puts that directory on the library path:
+//!
+//!     b.installArtifact(ort.artifact("OpenCL"));
+//!
+//! Nothing links it, so a consumer that only wants the NPU can leave the
+//! artifact alone and it is never built. See `openclLoader`.
 
 const std = @import("std");
 const sources = @import("sources.zig");
@@ -37,6 +47,7 @@ pub fn build(b: *std.Build) void {
         const shared = parts.providersShared();
         b.installArtifact(shared);
         b.installArtifact(parts.openvinoProvider(shared));
+        b.installArtifact(openclLoader(b, target, optimize));
     }
 }
 
@@ -572,6 +583,89 @@ const Parts = struct {
         if (openvino.fetch) |fetch| provider.step.dependOn(&fetch.step);
         return provider;
     }
+};
+
+/// Khronos' OpenCL ICD loader, compiled from source as `libOpenCL.so.1`.
+///
+/// `libopenvino_intel_gpu_plugin.so` has this in its `DT_NEEDED`, so the plugin
+/// will not load at all without one present -- and it is the one piece of the
+/// GPU stack that is neither a driver nor something a distribution reliably
+/// packages. NixOS is the case in point: `hardware.graphics` installs the Intel
+/// driver, and the loader is a separate package (`ocl-icd`) that nothing pulls
+/// in. Compiling it here is what keeps a GPU build a question of having a
+/// driver and nothing else.
+///
+/// It belongs to this package rather than to a consumer because the
+/// requirement does: the plugin that carries it is inside the OpenVINO release
+/// `openvino_version` pins, so the two move together.
+///
+/// The version script is not decoration. The plugin calls in through versioned
+/// symbols -- `clGetPlatformIDs@OPENCL_1.0` and the rest, up to `OPENCL_3.0` --
+/// so a loader built without it exports every right name under no version at
+/// all and satisfies none of them. Everything else here is `CMakeLists.txt`
+/// read back out.
+///
+/// Unlike the rest of an OpenVINO build this is plain C over libc, so it wants
+/// none of `cxxModule`: no libstdc++, no RTTI, nothing to keep in ABI step.
+fn openclLoader(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) *std.Build.Step.Compile {
+    const headers = b.dependency("opencl_headers", .{});
+    const source = b.dependency("opencl_icd_loader", .{});
+
+    // What CMake's `configure_file` writes after probing for the function.
+    // glibc has had `secure_getenv` since 2.17 and the loader falls back to
+    // plain `getenv` without it, so the probe has one answer worth having here.
+    const config = b.addWriteFiles();
+    _ = config.add("icd_cmake_config.h", "#define HAVE_SECURE_GETENV\n");
+
+    const mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    mod.addIncludePath(headers.path("."));
+    mod.addIncludePath(source.path("include"));
+    mod.addIncludePath(source.path("loader"));
+    mod.addIncludePath(config.getDirectory());
+    mod.addCSourceFiles(.{
+        .root = source.path("loader"),
+        .files = &.{
+            "icd.c",
+            "icd_dispatch.c",
+            "icd_dispatch_generated.c",
+            "icd_trace.c",
+            "linux/icd_linux.c",
+            "linux/icd_linux_library.c",
+            "linux/icd_linux_envvars.c",
+        },
+        .flags = &opencl_loader_flags,
+    });
+
+    const lib = b.addLibrary(.{
+        .name = "OpenCL",
+        .linkage = .dynamic,
+        // The soname the plugin has in its `DT_NEEDED` is `libOpenCL.so.1`,
+        // which is this major and nothing else about the version.
+        .version = .{ .major = 1, .minor = 0, .patch = 0 },
+        .root_module = mod,
+    });
+    lib.setVersionScript(source.path("loader/linux/icd_exports.map"));
+    return lib;
+}
+
+const opencl_loader_flags = [_][]const u8{
+    "-std=gnu99",
+    "-DCL_TARGET_OPENCL_VERSION=310",
+    "-DCL_NO_NON_ICD_DISPATCH_EXTENSION_PROTOTYPES",
+    "-DOPENCL_ICD_LOADER_VERSION_MAJOR=3",
+    "-DOPENCL_ICD_LOADER_VERSION_MINOR=1",
+    "-DOPENCL_ICD_LOADER_VERSION_REV=0",
+    "-DCL_ENABLE_LAYERS",
+    "-DCL_ENABLE_LOADER_MANAGED_DISPATCH",
+    "-DCL_SHARED_BUILD",
 };
 
 fn buildProtoc(b: *std.Build, protobuf: *std.Build.Dependency) *std.Build.Step.Compile {

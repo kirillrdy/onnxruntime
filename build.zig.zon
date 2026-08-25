@@ -63,5 +63,13 @@
             .url = "https://gitlab.com/libeigen/eigen/-/archive/1d8b82b0740839c0de7f1242a3585e3390ff5f33/eigen-1d8b82b0740839c0de7f1242a3585e3390ff5f33.tar.gz",
             .hash = "N-V-__8AAN2YAQHtb4uGS3lW6pQGY_b87n6uwg1_SoL9slvT",
         },
+        .opencl_headers = .{
+            .url = "git+https://github.com/KhronosGroup/OpenCL-Headers?ref=v2026.05.29#6fe718c31a45fe25151362a72ef041c3a1047cbd",
+            .hash = "N-V-__8AAEm0CAAEW33nP9aCUOvVMpgTvV3LxivhVTPQUD-T",
+        },
+        .opencl_icd_loader = .{
+            .url = "git+https://github.com/KhronosGroup/OpenCL-ICD-Loader?ref=v2026.05.29#b7bd2803acc779c03d96588e9ca9e9568a18698a",
+            .hash = "N-V-__8AAKkHDgClP0f2ooHf8q5_hsQh3y1JFUzxyh9wX_rK",
+        },
     },
 }
