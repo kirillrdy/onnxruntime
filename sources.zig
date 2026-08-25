@@ -501,7 +501,10 @@ const cpuinfo_linux_sources = [_][]const u8{
     "src/linux/smallfile.c",
 };
 
-const apple_device_discovery_sources = [_][]const u8{"core/platform/apple/device_discovery.cc"};
+const apple_device_discovery_sources = [_][]const u8{
+    "core/platform/apple/device_discovery.cc",
+    "core/platform/apple/logging/apple_log_sink.mm",
+};
 const linux_device_discovery_sources = [_][]const u8{"core/platform/linux/device_discovery.cc"};
 const default_device_discovery_sources = [_][]const u8{"core/platform/device_discovery_default.cc"};
 

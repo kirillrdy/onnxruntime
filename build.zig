@@ -423,6 +423,10 @@ const Parts = struct {
 
         const lib_mod = self.cxxModule(self.target);
         lib_mod.addIncludePath(self.protos);
+        if (self.target.result.os.tag.isDarwin()) {
+            lib_mod.linkFramework("Foundation", .{});
+            lib_mod.linkFramework("CoreFoundation", .{});
+        }
 
         lib_mod.addCSourceFiles(.{ .root = self.protos, .files = &sources.onnx_proto_sources, .flags = self.flags });
         lib_mod.addCSourceFiles(.{
