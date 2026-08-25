@@ -187,23 +187,7 @@ pub fn openvinoRuntimeLibraryPaths(b: *std.Build) []const []const u8 {
 }
 
 /// The device an OpenVINO execution provider run is meant to reach.
-pub const OpenVinoDevice = enum {
-    npu,
-    gpu,
-    cpu,
-
-    /// Libraries the device's plugin stack dlopens by name.
-    ///
-    /// The GPU's loader is an artifact of this package and its driver is named
-    /// by path, while the CPU has no external stack at all.
-    fn libraries(self: OpenVinoDevice) []const []const u8 {
-        return switch (self) {
-            .npu => &.{ "libze_loader.so.1", "libze_intel_npu.so.1" },
-            .gpu => &.{},
-            .cpu => &.{},
-        };
-    }
-};
+pub const OpenVinoDevice = enum { npu, gpu, cpu };
 
 /// Give a run step the environment needed by an OpenVINO device stack.
 ///
@@ -228,34 +212,28 @@ pub fn addOpenVinoRuntimeEnvironment(
 
     var dirs: std.ArrayList([]const u8) = .empty;
     defer dirs.deinit(b.allocator);
+    if (run.getEnvMap().get("LD_LIBRARY_PATH")) |inherited| {
+        if (inherited.len != 0) dirs.append(b.allocator, inherited) catch @panic("OOM");
+    }
+    dirs.appendSlice(b.allocator, extra) catch @panic("OOM");
     dirs.appendSlice(b.allocator, known) catch @panic("OOM");
 
-    for (device.libraries()) |library_name| {
-        var found = false;
-        for (extra) |dir| found = found or hasLibrary(b, dir, library_name);
-        if (found) continue;
-        for (device_library_dirs) |dir| {
+    if (device == .npu) for ([2][]const u8{ "libze_loader.so.1", "libze_intel_npu.so.1" }) |library_name| {
+        for (extra) |dir| {
+            if (hasLibrary(b, dir, library_name)) break;
+        } else for (device_library_dirs) |dir| {
             if (!hasLibrary(b, dir, library_name)) continue;
             for (dirs.items) |seen| {
                 if (std.mem.eql(u8, seen, dir)) break;
             } else dirs.append(b.allocator, dir) catch @panic("OOM");
             break;
         }
-    }
+    };
 
-    var path: std.ArrayList(u8) = .empty;
-    defer path.deinit(b.allocator);
-
-    if (run.getEnvMap().get("LD_LIBRARY_PATH")) |inherited| {
-        if (inherited.len != 0) path.appendSlice(b.allocator, inherited) catch @panic("OOM");
-    }
-    for ([_][]const []const u8{ extra, dirs.items }) |list| {
-        for (list) |dir| {
-            if (path.items.len != 0) path.append(b.allocator, ':') catch @panic("OOM");
-            path.appendSlice(b.allocator, dir) catch @panic("OOM");
-        }
-    }
-    if (path.items.len != 0) run.setEnvironmentVariable("LD_LIBRARY_PATH", path.items);
+    if (dirs.items.len != 0) run.setEnvironmentVariable(
+        "LD_LIBRARY_PATH",
+        std.mem.join(b.allocator, ":", dirs.items) catch @panic("OOM"),
+    );
 }
 
 /// Common roots for device libraries. The NPU loader and driver may be in
