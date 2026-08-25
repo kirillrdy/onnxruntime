@@ -7,6 +7,7 @@
         "build.zig",
         "build.zig.zon",
         "sources.zig",
+        "coreml",
         "tools",
         "README.md",
     },
@@ -70,6 +71,14 @@
         .opencl_icd_loader = .{
             .url = "git+https://github.com/KhronosGroup/OpenCL-ICD-Loader?ref=v2026.05.29#b7bd2803acc779c03d96588e9ca9e9568a18698a",
             .hash = "N-V-__8AAKkHDgClP0f2ooHf8q5_hsQh3y1JFUzxyh9wX_rK",
+        },
+        .coremltools = .{
+            .url = "https://github.com/apple/coremltools/archive/refs/tags/7.1.zip",
+            .hash = "N-V-__8AAKFNnQOnPt_L7eWjFz1ZSM9Nl6OCUj8tosEe4HVd",
+        },
+        .fp16 = .{
+            .url = "https://github.com/Maratyszcza/FP16/archive/0a92994d729ff76a58f692d3028ca1b64b145d91.zip",
+            .hash = "N-V-__8AAPRiBwBHv9btEWjPRJO11PX1lgrFYE4i4sw3iA8W",
         },
     },
 }

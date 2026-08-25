@@ -300,7 +300,11 @@ const Parts = struct {
     abseil: *std.Build.Dependency,
     re2: *std.Build.Dependency,
     cpuinfo: *std.Build.Dependency,
+    json: *std.Build.Dependency,
+    coremltools: ?*std.Build.Dependency,
+    fp16: ?*std.Build.Dependency,
     protos: std.Build.LazyPath,
+    coreml_protos: ?std.Build.LazyPath,
     includes: []const std.Build.LazyPath,
     flags: []const []const u8,
 
@@ -316,6 +320,10 @@ const Parts = struct {
         const abseil = b.dependency("abseil", .{});
         const re2 = b.dependency("re2", .{});
         const cpuinfo = b.dependency("cpuinfo", .{});
+        const json = b.dependency("json", .{});
+        const is_darwin = target.result.os.tag.isDarwin();
+        const coremltools = if (is_darwin) b.dependency("coremltools", .{}) else null;
+        const fp16 = if (is_darwin) b.dependency("fp16", .{}) else null;
 
         const config = b.addWriteFiles();
         _ = config.add("onnxruntime_config.h", b.fmt(ort_config_header, .{build_zon.version}));
@@ -351,6 +359,18 @@ const Parts = struct {
         generate.addArg("--cpp_out");
         const protos = generate.addOutputDirectoryArg("onnx-proto");
 
+        var coreml_protos: ?std.Build.LazyPath = null;
+        if (coremltools) |coreml| {
+            const generate_coreml = b.addRunArtifact(protoc);
+            for (sources.coreml_proto_sources) |proto| {
+                generate_coreml.addFileArg(coreml.path(b.fmt("mlmodel/format/{s}", .{proto})));
+            }
+            generate_coreml.addArg("-I");
+            generate_coreml.addDirectoryArg(coreml.path("mlmodel/format"));
+            generate_coreml.addArg("--cpp_out");
+            coreml_protos = generate_coreml.addOutputDirectoryArg("coreml_proto");
+        }
+
         const includes = b.allocator.dupe(std.Build.LazyPath, &.{
             config.getDirectory(),
             ort.path("include/onnxruntime"),
@@ -371,12 +391,16 @@ const Parts = struct {
             b.dependency("gsl", .{}).path("include"),
             b.dependency("mp11", .{}).path("include"),
             b.dependency("safeint", .{}).path(""),
-            b.dependency("json", .{}).path("single_include"),
+            json.path("single_include"),
         }) catch @panic("OOM");
 
         const cxx_base = if (openvino) &ort_openvino_flags else &ort_flags;
-        const cxx_flags = if (target.result.os.tag.isDarwin())
-            concatFlags(b, &.{ cxx_base, &.{"-gline-tables-only"} })
+        const cxx_flags = if (is_darwin)
+            concatFlags(b, &.{ cxx_base, &.{
+                "-gline-tables-only",
+                "-DUSE_COREML=1",
+                "-DCOREML_ENABLE_MLPROGRAM=1",
+            } })
         else
             cxx_base;
 
@@ -392,7 +416,11 @@ const Parts = struct {
             .abseil = abseil,
             .re2 = re2,
             .cpuinfo = cpuinfo,
+            .json = json,
+            .coremltools = coremltools,
+            .fp16 = fp16,
             .protos = protos,
+            .coreml_protos = coreml_protos,
             .includes = includes,
             .flags = cxx_flags,
         };
@@ -426,6 +454,41 @@ const Parts = struct {
         if (self.target.result.os.tag.isDarwin()) {
             lib_mod.linkFramework("Foundation", .{});
             lib_mod.linkFramework("CoreFoundation", .{});
+            lib_mod.linkFramework("CoreML", .{});
+
+            const coreml = self.coremltools.?;
+            const coreml_protos = self.coreml_protos.?;
+            lib_mod.addIncludePath(coreml_protos.dirname());
+            lib_mod.addIncludePath(coreml.path(""));
+            lib_mod.addIncludePath(coreml.path("mlmodel/src"));
+            lib_mod.addIncludePath(coreml.path("modelpackage/src"));
+            lib_mod.addIncludePath(self.json.path("single_include/nlohmann"));
+            lib_mod.addIncludePath(self.fp16.?.path("include"));
+            lib_mod.addCSourceFiles(.{
+                .root = coreml_protos,
+                .files = &sources.coreml_proto_generated_sources,
+                .flags = self.flags,
+            });
+            lib_mod.addCSourceFiles(.{
+                .root = ort_root,
+                .files = &sources.ort_coreml_sources,
+                .flags = self.flags,
+            });
+            lib_mod.addCSourceFiles(.{
+                .root = b.path(""),
+                .files = &sources.ort_coreml_override_sources,
+                .flags = self.flags,
+            });
+            lib_mod.addCSourceFiles(.{
+                .root = ort_root,
+                .files = &sources.ort_coreml_objc_sources,
+                .flags = concatFlags(b, &.{ self.flags, &.{"-fobjc-arc"} }),
+            });
+            lib_mod.addCSourceFiles(.{
+                .root = coreml.path(""),
+                .files = &sources.coremltools_sources,
+                .flags = self.flags,
+            });
         }
 
         lib_mod.addCSourceFiles(.{ .root = self.protos, .files = &sources.onnx_proto_sources, .flags = self.flags });
