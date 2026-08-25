@@ -184,6 +184,14 @@ pub const FileFlags = struct {
 const spin_pause_file = "core/common/spin_pause.cc";
 const spin_pause_waitpkg = [_]FileFlags{.{ .file = spin_pause_file, .flags = &.{"-mwaitpkg"} }};
 const spin_pause_plain = [_]FileFlags{.{ .file = spin_pause_file, .flags = &.{} }};
+const posix_env_file = "core/platform/posix/env.cc";
+// ORT disables cpuinfo on Apple and otherwise assumes two threads per core.
+// This build already includes cpuinfo's Mach backend, so use its topology data.
+const posix_env_cpuinfo = [_]FileFlags{.{
+    .file = posix_env_file,
+    .flags = &.{ "-DORT_USE_CPUINFO", "-includecpuinfo.h" },
+}};
+const posix_env_plain = [_]FileFlags{.{ .file = posix_env_file, .flags = &.{} }};
 
 pub const TargetSources = struct {
     cpuinfo: []const []const u8,
@@ -211,7 +219,10 @@ pub fn forTarget(target: std.Target) TargetSources {
             .mlas = &ort_mlas_x86_64_sources,
             .mlas_groups = &ort_mlas_x86_64_groups,
             .device_discovery = device_discovery,
-            .file_flags = &spin_pause_waitpkg,
+            .file_flags = if (is_darwin)
+                &(spin_pause_waitpkg ++ posix_env_cpuinfo)
+            else
+                &(spin_pause_waitpkg ++ posix_env_plain),
         },
         .aarch64 => .{
             .cpuinfo = if (is_darwin)
@@ -221,7 +232,10 @@ pub fn forTarget(target: std.Target) TargetSources {
             .mlas = &ort_mlas_aarch64_sources,
             .mlas_groups = &ort_mlas_aarch64_groups,
             .device_discovery = device_discovery,
-            .file_flags = &spin_pause_plain,
+            .file_flags = if (is_darwin)
+                &(spin_pause_plain ++ posix_env_cpuinfo)
+            else
+                &(spin_pause_plain ++ posix_env_plain),
         },
         else => std.debug.panic("unsupported architecture: {s}", .{@tagName(target.cpu.arch)}),
     };
@@ -528,7 +542,6 @@ pub const ort_common_sources = [_][]const u8{
     "core/platform/env_time.cc",
     "core/platform/logging/make_platform_default_log_sink.cc",
     "core/platform/path_lib.cc",
-    "core/platform/posix/env.cc",
     "core/platform/posix/env_time.cc",
     "core/platform/posix/stacktrace.cc",
     "core/platform/posix/telemetry_sha256.cc",
