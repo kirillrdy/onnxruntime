@@ -1,35 +1,3 @@
-//! ONNX Runtime, built from source by the Zig build system.
-//!
-//! Everything the runtime needs -- protobuf and a host protoc, onnx, abseil,
-//! re2, cpuinfo -- is compiled here from pinned source archives. Upstream's
-//! CMake is not involved: the file lists live in sources.zig. The C++ runtime
-//! comes from Zig's own libc++, so the result links against no system library
-//! beyond libc, and cross-compiling needs nothing installed for the target.
-//!
-//!     const ort = b.dependency("onnxruntime", .{
-//!         .target = target,
-//!         .optimize = optimize,
-//!     });
-//!     exe.root_module.linkLibrary(ort.artifact("onnxruntime"));
-//!
-//! Linking the artifact brings its headers with it, so `@cInclude`ing
-//! "onnxruntime_c_api.h" then works with no include path of your own.
-//!
-//! `-Dopenvino=<prefix>` additionally builds the OpenVINO execution provider,
-//! which is how ONNX Runtime reaches an Intel NPU or iGPU. That build links a
-//! system OpenVINO and so gives up the properties above; see `OpenVino`.
-//!
-//! It also builds an OpenCL ICD loader, because the GPU plugin inside that
-//! OpenVINO has `libOpenCL.so.1` in its `DT_NEEDED` and not every distribution
-//! packages one. A consumer that wants the GPU installs it beside the provider
-//! and lets `addOpenVinoRuntimeEnvironment` make the device stack reachable:
-//!
-//!     b.installArtifact(ort.artifact("OpenCL"));
-//!     onnxruntime.addOpenVinoRuntimeEnvironment(b, run, .gpu, extra, known, null);
-//!
-//! Nothing links it, so a consumer that only wants the NPU can leave the
-//! artifact alone and it is never built. See `openclLoader`.
-
 const std = @import("std");
 const sources = @import("sources.zig");
 const build_zon = @import("build.zig.zon");
@@ -37,147 +5,150 @@ const build_zon = @import("build.zig.zon");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const fetch = fetchStep(b);
 
-    const parts = Parts.init(b, target, optimize, OpenVino.option(b, target, fetch));
+    const fetch_exe = b.addExecutable(.{
+        .name = "fetch",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/fetch.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    const archive = b.cache_root.join(b.allocator, &.{ "onnxruntime", openvino_archive }) catch @panic("OOM");
+    const fetch = b.addRunArtifact(fetch_exe);
+    fetch.has_side_effects = true;
+    fetch.addArgs(&.{
+        "--url",     openvino_url,
+        "--out",     archive,
+        "--sha256",  openvino_sha256,
+        "--extract", openvinoRoot(b),
+        "--label",   "OpenVINO " ++ openvino_version ++ " (111 MiB)",
+    });
+    b.step("fetch-openvino", "Download the pinned Intel OpenVINO release").dependOn(&fetch.step);
+
+    const openvino = b.option(
+        bool,
+        "openvino",
+        "Build the Intel NPU and GPU OpenVINO execution provider",
+    ) orelse false;
+    if (openvino and !target.query.isNative()) {
+        std.log.err("an OpenVINO build runs on the host's libstdc++ and cannot cross-compile", .{});
+        std.process.exit(1);
+    }
+
+    const parts = Parts.init(b, target, optimize, openvino);
     b.installArtifact(parts.runtime());
-    if (parts.openvino != null) {
-        // Built once and passed along: the provider has to link the very
-        // library that gets installed, or the ProviderHost pointer they are
-        // supposed to share would sit in two different objects.
-        const shared = parts.providersShared();
+    if (parts.openvino) {
+        const openvino_root = openvinoRoot(b);
+        const openvino_include = b.pathJoin(&.{ openvino_root, "runtime", "include" });
+        const openvino_lib = b.pathJoin(&.{ openvino_root, "runtime", "lib", "intel64" });
+        const shared_mod = parts.cxxModule(parts.target);
+        shared_mod.addCSourceFiles(.{
+            .root = parts.ort.path("onnxruntime"),
+            .files = &sources.ort_provider_host_sources,
+            .flags = parts.flags,
+        });
+        parts.linkCxx(shared_mod);
+        const shared = b.addLibrary(.{
+            .name = "onnxruntime_providers_shared",
+            .linkage = .dynamic,
+            .root_module = shared_mod,
+        });
+        shared.setVersionScript(parts.ort.path("onnxruntime/core/providers/shared/version_script.lds"));
         b.installArtifact(shared);
-        b.installArtifact(parts.openvinoProvider(shared));
-        b.installArtifact(openclLoader(b, target, optimize));
+
+        const provider_mod = parts.cxxModule(parts.target);
+        provider_mod.addIncludePath(parts.protos);
+        provider_mod.addIncludePath(.{ .cwd_relative = openvino_include });
+        const provider_flags = concatFlags(b, &.{
+            parts.flags,
+            &.{
+                "-DUSE_OVEP_NPU_MEMORY=1",
+                "-DFILE_NAME=\"libonnxruntime_providers_openvino.so\"",
+                "-Wno-elaborated-enum-class",
+                "-Wno-c++11-narrowing",
+            },
+        });
+        const ort_root = parts.ort.path("onnxruntime");
+        provider_mod.addCSourceFiles(.{ .root = ort_root, .files = &sources.ort_openvino_sources, .flags = provider_flags });
+        provider_mod.addCSourceFiles(.{ .root = ort_root, .files = &sources.ort_provider_shared_sources, .flags = provider_flags });
+        provider_mod.addCSourceFiles(.{ .root = parts.protos, .files = &sources.onnx_proto_sources, .flags = provider_flags });
+        provider_mod.addCSourceFiles(.{ .root = parts.protobuf.path(""), .files = &sources.protobuf_lite_sources, .flags = provider_flags });
+        provider_mod.addCSourceFiles(.{ .root = parts.abseil.path(""), .files = &sources.abseil_sources, .flags = provider_flags });
+        provider_mod.addLibraryPath(.{ .cwd_relative = openvino_lib });
+        provider_mod.linkSystemLibrary("openvino", .{});
+        provider_mod.addRPath(.{ .cwd_relative = openvino_lib });
+        parts.linkCxx(provider_mod);
+        const provider = b.addLibrary(.{
+            .name = "onnxruntime_providers_openvino",
+            .linkage = .dynamic,
+            .root_module = provider_mod,
+        });
+        provider.setVersionScript(parts.ort.path("onnxruntime/core/providers/openvino/version_script.lds"));
+        provider.root_module.linkLibrary(shared);
+        provider.root_module.addRPath(.{ .cwd_relative = "$ORIGIN" });
+        provider.step.dependOn(&fetch.step);
+        b.installArtifact(provider);
+
+        const headers = b.dependency("opencl_headers", .{});
+        const source = b.dependency("opencl_icd_loader", .{});
+        const config = b.addWriteFiles();
+        _ = config.add("icd_cmake_config.h", "#define HAVE_SECURE_GETENV\n");
+        const opencl_mod = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        opencl_mod.addIncludePath(headers.path("."));
+        opencl_mod.addIncludePath(source.path("include"));
+        opencl_mod.addIncludePath(source.path("loader"));
+        opencl_mod.addIncludePath(config.getDirectory());
+        opencl_mod.addCSourceFiles(.{
+            .root = source.path("loader"),
+            .files = &.{
+                "icd.c",
+                "icd_dispatch.c",
+                "icd_dispatch_generated.c",
+                "icd_trace.c",
+                "linux/icd_linux.c",
+                "linux/icd_linux_library.c",
+                "linux/icd_linux_envvars.c",
+            },
+            .flags = &opencl_loader_flags,
+        });
+        const opencl = b.addLibrary(.{
+            .name = "OpenCL",
+            .linkage = .dynamic,
+            .version = .{ .major = 1, .minor = 0, .patch = 0 },
+            .root_module = opencl_mod,
+        });
+        opencl.setVersionScript(source.path("loader/linux/icd_exports.map"));
+        b.installArtifact(opencl);
     }
 }
 
-/// The ONNX Runtime static library, headers included. Linking it is all a
-/// dependent has to do.
 pub fn library(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
 ) *std.Build.Step.Compile {
-    return Parts.init(b, target, optimize, null).runtime();
+    return Parts.init(b, target, optimize, false).runtime();
 }
 
-/// Put the C++ standard library a `-Dopenvino` build was compiled against on
-/// a consuming module's link line.
-///
-/// Needed because that build runs on the host's libstdc++ rather than Zig's
-/// libc++, and Zig does not carry a static library's own link objects across
-/// to whoever links it -- so without this the final link ends in undefined
-/// `__cxa_begin_catch` and friends. The default build needs nothing of the
-/// sort; its libc++ comes along with the artifact.
-///
-///     const ort = b.dependency("onnxruntime", .{ ... });
-///     exe.root_module.linkLibrary(ort.artifact("onnxruntime"));
-///     @import("onnxruntime").linkStdCxx(b, exe.root_module);
 pub fn linkStdCxx(b: *std.Build, mod: *std.Build.Module) void {
     Gnu.detect(b).link(mod);
 }
 
-/// A system OpenVINO to build the execution provider against.
-///
-/// The NPU is only reachable through Intel's own compiler, which ships as a
-/// prebuilt binary inside the OpenVINO install, so this half of the build
-/// cannot come from source the way the rest does. What it costs: the provider
-/// links libopenvino.so, and because provider and runtime hand each other C++
-/// objects across the dlopen boundary, the *whole* build has to match
-/// OpenVINO's ABI -- GCC's libstdc++, with RTTI on, for the host only.
-pub const OpenVino = struct {
-    /// Where `openvino/openvino.hpp` lives. Defaults to `<prefix>/include`;
-    /// package managers that split a build into `dev` and `lib` outputs need
-    /// this pointed at the former.
-    include: []const u8,
-    /// Where `libopenvino.so` lives, along with `openvino/` or the plugins
-    /// themselves -- the NPU plugin and Intel's NPU compiler among them.
-    /// Defaults to `<prefix>/lib`; Intel's own archives put all of it in
-    /// `runtime/lib/intel64`, which no prefix describes.
-    lib: []const u8,
-    /// The download this was unpacked from, for the provider to wait on, or
-    /// null when an installed OpenVINO was named and there is nothing to fetch.
-    fetch: ?*std.Build.Step.Run,
-
-    fn option(b: *std.Build, target: std.Build.ResolvedTarget, fetch: *std.Build.Step.Run) ?OpenVino {
-        // All four declared before any is read: an option only shows up in
-        // `zig build --help`, and only becomes settable, once b.option has
-        // been reached, so returning early would hide the rest.
-        const prefix_option = b.option(
-            []const u8,
-            "openvino",
-            "Prefix of a system OpenVINO (2026.0+) to build the execution provider against, for Intel NPU and GPU support",
-        );
-        const include_option = b.option(
-            []const u8,
-            "openvino-include",
-            "Include directory of the OpenVINO headers, if not <prefix>/include",
-        );
-        const lib_option = b.option(
-            []const u8,
-            "openvino-lib",
-            "Directory holding libopenvino.so and the plugins, if not <prefix>/lib",
-        );
-        const fetch_option = b.option(
-            bool,
-            "openvino-fetch",
-            "Build against the OpenVINO release `fetch-openvino` downloads, rather than one installed on the machine",
-        ) orelse false;
-
-        if (prefix_option == null and !fetch_option) return null;
-        if (prefix_option != null and fetch_option) {
-            std.log.err("-Dopenvino names an installed OpenVINO and -Dopenvino-fetch downloads one; pass one or the other", .{});
-            std.process.exit(1);
-        }
-
-        // The libstdc++ this drags in is the host's, found by asking the host
-        // compiler. Handing those headers to a cross build would be nonsense.
-        if (!target.query.isNative()) {
-            std.log.err("an OpenVINO build runs on the host's libstdc++ and cannot cross-compile", .{});
-            std.process.exit(1);
-        }
-
-        const default_include, const default_lib, const fetch_step = if (prefix_option) |prefix|
-            .{ b.pathJoin(&.{ prefix, "include" }), b.pathJoin(&.{ prefix, "lib" }), null }
-        else
-            .{ b.pathJoin(&.{ openvinoRoot(b), "runtime", "include" }), b.pathJoin(&.{ openvinoRoot(b), "runtime", "lib", "intel64" }), fetch };
-
-        return .{
-            .include = include_option orelse default_include,
-            .lib = lib_option orelse default_lib,
-            .fetch = fetch_step,
-        };
-    }
-};
-
-/// The OpenVINO release `fetch-openvino` downloads.
-///
-/// Pinned to a build rather than a version: Intel's archive names itself by
-/// commit, and the NPU compiler inside it is what decides whether a graph
-/// compiles at all, so "2026.3" on its own is not a thing to depend on. The
-/// checksum is the one Intel publishes beside the archive.
 const openvino_version = "2026.3.0";
 const openvino_build = "22451.bd8d6542e3c";
 const openvino_archive = "openvino_toolkit_ubuntu24_" ++ openvino_version ++ "." ++ openvino_build ++ "_x86_64.tgz";
 const openvino_url = "https://storage.openvinotoolkit.org/repositories/openvino/packages/2026.3/linux/" ++ openvino_archive;
 const openvino_sha256 = "0fa43c270bb6bc17bcf8c2c5fc5aa4595377292d54ef38084d8a0390daf4af98";
 
-/// Where the archive is unpacked: the *consumer's* build cache, since a
-/// dependency inherits its parent's `cache_root`. So one copy is shared by
-/// every configuration of a project, and `zig build --clean` reaches it.
 fn openvinoRoot(b: *std.Build) []const u8 {
     return b.cache_root.join(b.allocator, &.{ "onnxruntime", "openvino" }) catch @panic("OOM");
 }
 
-/// Directories a program built against the downloaded OpenVINO has to have on
-/// its library path at run time.
-///
-/// The provider carries an rpath to the library directory, but `libopenvino.so`
-/// itself carries none, and it links oneTBB -- which is in the archive, in a
-/// directory of its own, and not anywhere the dynamic loader looks. Naming both
-/// here rather than only oneTBB keeps this true of a program run from any
-/// working directory.
 pub fn openvinoRuntimeLibraryPaths(b: *std.Build) []const []const u8 {
     const root = openvinoRoot(b);
     const paths = b.allocator.alloc([]const u8, 2) catch @panic("OOM");
@@ -186,17 +157,8 @@ pub fn openvinoRuntimeLibraryPaths(b: *std.Build) []const []const u8 {
     return paths;
 }
 
-/// The device an OpenVINO execution provider run is meant to reach.
 pub const OpenVinoDevice = enum { npu, gpu, cpu };
 
-/// Give a run step the environment needed by an OpenVINO device stack.
-///
-/// `extra` is a caller-supplied list of directories to search first. `known`
-/// contains directories the build created itself, such as the downloaded
-/// OpenVINO runtime and the install directory holding the OpenCL loader; these
-/// are put on the library path without probing them during build graph setup.
-/// `opencl_driver_path` can name one exact GPU driver, otherwise the system ICD
-/// registry and common library roots are inspected.
 pub fn addOpenVinoRuntimeEnvironment(
     b: *std.Build,
     run: *std.Build.Step.Run,
@@ -206,7 +168,28 @@ pub fn addOpenVinoRuntimeEnvironment(
     opencl_driver_path: ?[]const u8,
 ) void {
     if (device == .gpu) {
-        const driver = opencl_driver_path orelse findOpenclDriver(b, extra);
+        const driver = opencl_driver_path orelse driver: {
+            const has_registry = registry: {
+                var dir = std.Io.Dir.openDirAbsolute(b.graph.io, "/etc/OpenCL/vendors", .{
+                    .iterate = true,
+                }) catch break :registry false;
+                defer dir.close(b.graph.io);
+                var it = dir.iterate();
+                while (it.next(b.graph.io) catch break :registry false) |entry| {
+                    if (std.mem.endsWith(u8, entry.name, ".icd")) break :registry true;
+                }
+                break :registry false;
+            };
+            if (has_registry) break :driver null;
+            for ([_][]const []const u8{ extra, &device_library_dirs }) |list| {
+                for (list) |root| {
+                    for ([_][]const u8{ b.pathJoin(&.{ root, opencl_driver_subdir }), root }) |dir| {
+                        if (hasLibrary(b, dir, opencl_driver)) break :driver b.pathJoin(&.{ dir, opencl_driver });
+                    }
+                }
+            }
+            break :driver null;
+        };
         if (driver) |path| run.setEnvironmentVariable("OCL_ICD_FILENAMES", path);
     }
 
@@ -236,9 +219,6 @@ pub fn addOpenVinoRuntimeEnvironment(
     );
 }
 
-/// Common roots for device libraries. The NPU loader and driver may be in
-/// different roots on NixOS, while ordinary distributions usually put both on
-/// the default dynamic-loader path.
 const device_library_dirs = [_][]const u8{
     "/run/opengl-driver/lib",
     "/run/current-system/sw/lib",
@@ -250,85 +230,16 @@ const device_library_dirs = [_][]const u8{
 const opencl_driver = "libigdrcl.so";
 const opencl_driver_subdir = "intel-opencl";
 
-fn findOpenclDriver(b: *std.Build, extra: []const []const u8) ?[]const u8 {
-    if (hasIcdRegistry(b)) return null;
-
-    for ([_][]const []const u8{ extra, &device_library_dirs }) |list| {
-        for (list) |root| {
-            for ([_][]const u8{ b.pathJoin(&.{ root, opencl_driver_subdir }), root }) |dir| {
-                if (hasLibrary(b, dir, opencl_driver)) return b.pathJoin(&.{ dir, opencl_driver });
-            }
-        }
-    }
-    return null;
-}
-
 fn hasLibrary(b: *std.Build, dir: []const u8, library_name: []const u8) bool {
     const path = b.pathJoin(&.{ dir, library_name });
     std.Io.Dir.accessAbsolute(b.graph.io, path, .{}) catch return false;
     return true;
 }
 
-fn hasIcdRegistry(b: *std.Build) bool {
-    var dir = std.Io.Dir.openDirAbsolute(b.graph.io, "/etc/OpenCL/vendors", .{
-        .iterate = true,
-    }) catch return false;
-    defer dir.close(b.graph.io);
-
-    var it = dir.iterate();
-    while (it.next(b.graph.io) catch return false) |entry| {
-        if (std.mem.endsWith(u8, entry.name, ".icd")) return true;
-    }
-    return false;
-}
-
-/// `zig build fetch-openvino`, and the step the provider hangs off.
-fn fetchStep(b: *std.Build) *std.Build.Step.Run {
-    const fetch_exe = b.addExecutable(.{
-        .name = "fetch",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tools/fetch.zig"),
-            .target = b.graph.host,
-            .optimize = .Debug,
-        }),
-    });
-
-    const archive = b.cache_root.join(b.allocator, &.{ "onnxruntime", openvino_archive }) catch @panic("OOM");
-    const run = b.addRunArtifact(fetch_exe);
-    run.has_side_effects = true;
-    run.addArgs(&.{
-        "--url",     openvino_url,
-        "--out",     archive,
-        "--sha256",  openvino_sha256,
-        "--extract", openvinoRoot(b),
-        "--label",   "OpenVINO " ++ openvino_version ++ " (111 MiB)",
-    });
-
-    const step = b.step("fetch-openvino", "Download Intel's OpenVINO release, for -Dopenvino-fetch");
-    step.dependOn(&run.step);
-    return run;
-}
-
-/// The host GCC installation, located by asking the compiler rather than by
-/// guessing paths, so this works the same on a distro and inside a Nix store.
 const Gnu = struct {
-    /// libstdc++ header directories, in search order.
     include: []const []const u8,
-    /// libstdc++ itself, and libgcc_s for the exception unwinder -- without
-    /// the second, every throw is an undefined _Unwind_Resume. Full paths,
-    /// because there is no way to ask for these by name: `stdc++` is matched
-    /// by isLibCxxLibName in Module.linkSystemLibrary, again in the compiler
-    /// driver, and both turn the request back into Zig's libc++ -- which then
-    /// puts its own headers ahead of GCC's and breaks the build. `-l:file`
-    /// syntax is no way out either; Zig resolves system libraries itself.
-    ///
-    /// libgcc_s is taken by its soname rather than the bare `.so`, which on
-    /// some installs is a linker script pulling in a static `-lgcc` that Zig
-    /// has no search path for.
     libraries: [2][]const u8,
 
-    /// Put the libraries, and an RPATH to find them again at run time, on a
-    /// module that is going to be linked into something.
     fn link(self: Gnu, mod: *std.Build.Module) void {
         for (self.libraries) |lib| {
             mod.addObjectFile(.{ .cwd_relative = lib });
@@ -339,9 +250,6 @@ const Gnu = struct {
     fn detect(b: *std.Build) Gnu {
         const cxx = b.graph.environ_map.get("CXX") orelse "c++";
 
-        // The include search list is printed on stderr, between two markers,
-        // hence the redirect: runAllowFail only hands back stdout. Only the
-        // C++ directories are wanted -- Zig supplies libc itself.
         const verbose = run(b, b.fmt("{s} -E -x c++ /dev/null -v 2>&1", .{cxx}));
         var include: std.ArrayList([]const u8) = .empty;
         var lines = std.mem.splitScalar(u8, verbose, '\n');
@@ -359,8 +267,6 @@ const Gnu = struct {
             std.process.exit(1);
         }
 
-        // -print-file-name echoes the name back unchanged when it cannot
-        // resolve it, which is the only signal that the library is missing.
         var libraries: [2][]const u8 = undefined;
         for ([_][]const u8{ "libstdc++.so", "libgcc_s.so.1" }, &libraries) |file, *out| {
             const path = std.mem.trim(u8, run(b, b.fmt("{s} -print-file-name={s}", .{ cxx, file })), " \t\r\n");
@@ -382,14 +288,11 @@ const Gnu = struct {
     }
 };
 
-/// The dependencies, include set and generated headers that both the runtime
-/// and the OpenVINO provider are built from. `b.dependency` is memoised, so
-/// naming them once here is only about not repeating the list.
 const Parts = struct {
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
-    openvino: ?OpenVino,
+    openvino: bool,
     gnu: ?Gnu,
     ort: *std.Build.Dependency,
     protobuf: *std.Build.Dependency,
@@ -399,14 +302,13 @@ const Parts = struct {
     cpuinfo: *std.Build.Dependency,
     protos: std.Build.LazyPath,
     includes: []const std.Build.LazyPath,
-    /// Flags for every C++ translation unit in the build.
     flags: []const []const u8,
 
     fn init(
         b: *std.Build,
         target: std.Build.ResolvedTarget,
         optimize: std.builtin.OptimizeMode,
-        openvino: ?OpenVino,
+        openvino: bool,
     ) Parts {
         const ort = b.dependency("ort_src", .{});
         const protobuf = b.dependency("protobuf", .{});
@@ -418,14 +320,37 @@ const Parts = struct {
         const config = b.addWriteFiles();
         _ = config.add("onnxruntime_config.h", b.fmt(ort_config_header, .{build_zon.version}));
 
-        // protoc runs during the build, so it is built for the host even when
-        // the runtime itself is cross-compiled.
-        const protos = generateOnnxProto(b, buildProtoc(b, protobuf), onnx);
+        const protoc_mod = b.createModule(.{
+            .target = b.graph.host,
+            .optimize = .ReleaseSmall,
+            .link_libc = true,
+            .link_libcpp = true,
+        });
+        protoc_mod.addIncludePath(protobuf.path("src"));
+        const protoc_flags = [_][]const u8{
+            "-std=c++17",
+            "-DGOOGLE_PROTOBUF_CMAKE_BUILD",
+            "-DHAVE_ZLIB=0",
+            "-w",
+        };
+        for ([_][]const []const u8{
+            &sources.protobuf_lite_sources,
+            &sources.protobuf_full_sources,
+            &sources.protoc_sources,
+            &.{"src/google/protobuf/compiler/main.cc"},
+        }) |list| {
+            protoc_mod.addCSourceFiles(.{ .root = protobuf.path(""), .files = list, .flags = &protoc_flags });
+        }
+        const protoc = b.addExecutable(.{ .name = "protoc", .root_module = protoc_mod });
+        const generate = b.addRunArtifact(protoc);
+        for ([_][]const u8{ "onnx-ml.proto", "onnx-operators-ml.proto", "onnx-data.proto" }) |proto| {
+            generate.addFileArg(onnx.path(b.fmt("onnx/{s}", .{proto})));
+        }
+        generate.addArg("-I");
+        generate.addDirectoryArg(onnx.path(""));
+        generate.addArg("--cpp_out");
+        const protos = generate.addOutputDirectoryArg("onnx-proto");
 
-        // Deliberately excludes `protos`. A generated include path is a step
-        // dependency, so listing it here would park all of mlas behind protoc
-        // instead of letting the two run at once; only the runtime proper needs
-        // the generated headers, and it adds them for itself below.
         const includes = b.allocator.dupe(std.Build.LazyPath, &.{
             config.getDirectory(),
             ort.path("include/onnxruntime"),
@@ -449,10 +374,7 @@ const Parts = struct {
             b.dependency("json", .{}).path("single_include"),
         }) catch @panic("OOM");
 
-        // -gline-tables-only: full DWARF for a build this size overruns what
-        // Mach-O's debug map can address, and the line tables are all the
-        // symbolicated backtraces here need.
-        const cxx_base = if (openvino == null) &ort_flags else &ort_openvino_flags;
+        const cxx_base = if (openvino) &ort_openvino_flags else &ort_flags;
         const cxx_flags = if (target.result.os.tag.isDarwin())
             concatFlags(b, &.{ cxx_base, &.{"-gline-tables-only"} })
         else
@@ -463,7 +385,7 @@ const Parts = struct {
             .target = target,
             .optimize = optimize,
             .openvino = openvino,
-            .gnu = if (openvino == null) null else Gnu.detect(b),
+            .gnu = if (openvino) Gnu.detect(b) else null,
             .ort = ort,
             .protobuf = protobuf,
             .onnx = onnx,
@@ -476,8 +398,6 @@ const Parts = struct {
         };
     }
 
-    /// A module compiled as C++ against the chosen runtime, seeded with the
-    /// shared include set.
     fn cxxModule(self: Parts, target: std.Build.ResolvedTarget) *std.Build.Module {
         const mod = self.b.createModule(.{
             .target = target,
@@ -487,20 +407,11 @@ const Parts = struct {
         });
         for (self.includes) |include| mod.addIncludePath(include);
         if (self.gnu) |gnu| {
-            // -I, not -isystem: Zig lists its own libc directories ahead of
-            // every -isystem path, and libstdc++'s <cstdlib> reaches its
-            // libc counterpart by #include_next, which only searches what
-            // comes after. The C++ headers have to be found first for that
-            // to land on glibc's stdlib.h.
             for (gnu.include) |dir| mod.addIncludePath(.{ .cwd_relative = dir });
         }
         return mod;
     }
 
-    /// Add the C++ standard library to a module that is about to be linked
-    /// into a shared library or an executable. `cxxModule` deliberately does
-    /// not do this: most modules here end up as static archives, which is the
-    /// one place these files must not go.
     fn linkCxx(self: Parts, mod: *std.Build.Module) void {
         if (self.gnu) |gnu| gnu.link(mod);
     }
@@ -576,182 +487,10 @@ const Parts = struct {
             }));
         }
 
-        // Travels with the artifact: a module that links this library gets the C
-        // API headers on its include path without naming a path itself.
         lib.installHeadersDirectory(self.ort.path("include/onnxruntime/core/session"), "", .{});
         return lib;
     }
-
-    /// libonnxruntime_providers_shared.so: one global ProviderHost pointer.
-    ///
-    /// Small, and shared for exactly one reason. The runtime dlopens this file
-    /// -- by name, out of the directory the running binary sits in -- and
-    /// calls Provider_SetHost to leave a vtable of its internals in the
-    /// global. Each provider .so links the same file and calls
-    /// Provider_GetHost to pick the vtable back up. A static library could not
-    /// do that job: each side would get its own copy of the global.
-    ///
-    /// The consequence for anyone linking the static runtime is that this file
-    /// has to be installed next to their executable, or loading a provider
-    /// fails with `undefined symbol: Provider_GetHost`.
-    fn providersShared(self: Parts) *std.Build.Step.Compile {
-        const b = self.b;
-        const mod = self.cxxModule(self.target);
-        mod.addCSourceFiles(.{
-            .root = self.ort.path("onnxruntime"),
-            .files = &sources.ort_provider_host_sources,
-            .flags = self.flags,
-        });
-        self.linkCxx(mod);
-        const shared = b.addLibrary(.{
-            .name = "onnxruntime_providers_shared",
-            .linkage = .dynamic,
-            .root_module = mod,
-        });
-        shared.setVersionScript(self.ort.path("onnxruntime/core/providers/shared/version_script.lds"));
-        return shared;
-    }
-
-    /// libonnxruntime_providers_openvino.so.
-    ///
-    /// A shared library and not part of libonnxruntime.a, because that is how
-    /// the runtime expects to find an OpenVINO EP: it dlopens the file and
-    /// calls CreateEpFactories. What it needs back from the runtime it reaches
-    /// through `providersShared`, which it links.
-    fn openvinoProvider(self: Parts, shared: *std.Build.Step.Compile) *std.Build.Step.Compile {
-        const b = self.b;
-        const openvino = self.openvino.?;
-        const ort_root = self.ort.path("onnxruntime");
-
-        const mod = self.cxxModule(self.target);
-        mod.addIncludePath(self.protos);
-        mod.addIncludePath(.{ .cwd_relative = openvino.include });
-
-        const flags_ = concatFlags(b, &.{
-            self.flags,
-            &.{
-                // OpenVINO 2024.4 and up let the provider allocate NPU-visible
-                // memory itself rather than copying into it.
-                "-DUSE_OVEP_NPU_MEMORY=1",
-                "-DFILE_NAME=\"libonnxruntime_providers_openvino.so\"",
-                // Upstream only ever compiles this provider with GCC, and two
-                // of its habits are hard errors for clang rather than the
-                // warnings GCC settles for: `enum class type` as an elaborated
-                // parameter type in exceptions.h, and a long narrowed to
-                // uint32_t inside a braced initializer in basic_backend.h.
-                "-Wno-elaborated-enum-class",
-                "-Wno-c++11-narrowing",
-            },
-        });
-        mod.addCSourceFiles(.{ .root = ort_root, .files = &sources.ort_openvino_sources, .flags = flags_ });
-        mod.addCSourceFiles(.{ .root = ort_root, .files = &sources.ort_provider_shared_sources, .flags = flags_ });
-
-        // The provider carries its own onnx protobuf and abseil rather than
-        // sharing the runtime's: the version script below hides every symbol
-        // that is not an entry point, so the two copies cannot collide.
-        mod.addCSourceFiles(.{ .root = self.protos, .files = &sources.onnx_proto_sources, .flags = flags_ });
-        mod.addCSourceFiles(.{ .root = self.protobuf.path(""), .files = &sources.protobuf_lite_sources, .flags = flags_ });
-        mod.addCSourceFiles(.{ .root = self.abseil.path(""), .files = &sources.abseil_sources, .flags = flags_ });
-
-        mod.addLibraryPath(.{ .cwd_relative = openvino.lib });
-        mod.linkSystemLibrary("openvino", .{});
-        // Loaded at run time from where it was linked, so the plugins beside
-        // it -- the NPU plugin, and Intel's NPU compiler -- are found too.
-        mod.addRPath(.{ .cwd_relative = openvino.lib });
-        self.linkCxx(mod);
-
-        const provider = b.addLibrary(.{
-            .name = "onnxruntime_providers_openvino",
-            .linkage = .dynamic,
-            .root_module = mod,
-        });
-        // Exports GetProvider, CreateEpFactories and ReleaseEpFactory, and
-        // hides the rest.
-        provider.setVersionScript(self.ort.path("onnxruntime/core/providers/openvino/version_script.lds"));
-        provider.root_module.linkLibrary(shared);
-        // The runtime dlopens providers_shared with RTLD_GLOBAL before any
-        // provider, so by this point the symbol is already in the process.
-        // $ORIGIN covers the case where it is not: the two are installed
-        // side by side.
-        provider.root_module.addRPath(.{ .cwd_relative = "$ORIGIN" });
-        // A downloaded OpenVINO is not on disk until its step has run, and the
-        // headers above are inside it -- so the compile waits on the download
-        // rather than the install.
-        if (openvino.fetch) |fetch| provider.step.dependOn(&fetch.step);
-        return provider;
-    }
 };
-
-/// Khronos' OpenCL ICD loader, compiled from source as `libOpenCL.so.1`.
-///
-/// `libopenvino_intel_gpu_plugin.so` has this in its `DT_NEEDED`, so the plugin
-/// will not load at all without one present -- and it is the one piece of the
-/// GPU stack that is neither a driver nor something a distribution reliably
-/// packages. NixOS is the case in point: `hardware.graphics` installs the Intel
-/// driver, and the loader is a separate package (`ocl-icd`) that nothing pulls
-/// in. Compiling it here is what keeps a GPU build a question of having a
-/// driver and nothing else.
-///
-/// It belongs to this package rather than to a consumer because the
-/// requirement does: the plugin that carries it is inside the OpenVINO release
-/// `openvino_version` pins, so the two move together.
-///
-/// The version script is not decoration. The plugin calls in through versioned
-/// symbols -- `clGetPlatformIDs@OPENCL_1.0` and the rest, up to `OPENCL_3.0` --
-/// so a loader built without it exports every right name under no version at
-/// all and satisfies none of them. Everything else here is `CMakeLists.txt`
-/// read back out.
-///
-/// Unlike the rest of an OpenVINO build this is plain C over libc, so it wants
-/// none of `cxxModule`: no libstdc++, no RTTI, nothing to keep in ABI step.
-fn openclLoader(
-    b: *std.Build,
-    target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-) *std.Build.Step.Compile {
-    const headers = b.dependency("opencl_headers", .{});
-    const source = b.dependency("opencl_icd_loader", .{});
-
-    // What CMake's `configure_file` writes after probing for the function.
-    // glibc has had `secure_getenv` since 2.17 and the loader falls back to
-    // plain `getenv` without it, so the probe has one answer worth having here.
-    const config = b.addWriteFiles();
-    _ = config.add("icd_cmake_config.h", "#define HAVE_SECURE_GETENV\n");
-
-    const mod = b.createModule(.{
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    mod.addIncludePath(headers.path("."));
-    mod.addIncludePath(source.path("include"));
-    mod.addIncludePath(source.path("loader"));
-    mod.addIncludePath(config.getDirectory());
-    mod.addCSourceFiles(.{
-        .root = source.path("loader"),
-        .files = &.{
-            "icd.c",
-            "icd_dispatch.c",
-            "icd_dispatch_generated.c",
-            "icd_trace.c",
-            "linux/icd_linux.c",
-            "linux/icd_linux_library.c",
-            "linux/icd_linux_envvars.c",
-        },
-        .flags = &opencl_loader_flags,
-    });
-
-    const lib = b.addLibrary(.{
-        .name = "OpenCL",
-        .linkage = .dynamic,
-        // The soname the plugin has in its `DT_NEEDED` is `libOpenCL.so.1`,
-        // which is this major and nothing else about the version.
-        .version = .{ .major = 1, .minor = 0, .patch = 0 },
-        .root_module = mod,
-    });
-    lib.setVersionScript(source.path("loader/linux/icd_exports.map"));
-    return lib;
-}
 
 const opencl_loader_flags = [_][]const u8{
     "-std=gnu99",
@@ -764,50 +503,6 @@ const opencl_loader_flags = [_][]const u8{
     "-DCL_ENABLE_LOADER_MANAGED_DISPATCH",
     "-DCL_SHARED_BUILD",
 };
-
-fn buildProtoc(b: *std.Build, protobuf: *std.Build.Dependency) *std.Build.Step.Compile {
-    // Pinned rather than inherited from the caller: this protoc runs three
-    // times on three small .proto files, so codegen quality buys nothing, and
-    // -Os builds protobuf roughly twice as fast as any other mode. Pinning
-    // also keeps the whole 167-file host build out of the consumer's
-    // -Doptimize cache key, so it is paid once per host instead of per mode.
-    //
-    // Always Zig's libc++, even in an OpenVINO build: protoc is a build-time
-    // tool that outputs .cc files, and shares an address space with nothing.
-    const protoc_mod = b.createModule(.{
-        .target = b.graph.host,
-        .optimize = .ReleaseSmall,
-        .link_libc = true,
-        .link_libcpp = true,
-    });
-    protoc_mod.addIncludePath(protobuf.path("src"));
-    const flags = [_][]const u8{
-        "-std=c++17",
-        "-DGOOGLE_PROTOBUF_CMAKE_BUILD",
-        "-DHAVE_ZLIB=0",
-        "-w",
-    };
-    for ([_][]const []const u8{
-        &sources.protobuf_lite_sources,
-        &sources.protobuf_full_sources,
-        &sources.protoc_sources,
-        &.{"src/google/protobuf/compiler/main.cc"},
-    }) |list| {
-        protoc_mod.addCSourceFiles(.{ .root = protobuf.path(""), .files = list, .flags = &flags });
-    }
-    return b.addExecutable(.{ .name = "protoc", .root_module = protoc_mod });
-}
-
-fn generateOnnxProto(b: *std.Build, protoc_exe: *std.Build.Step.Compile, onnx: *std.Build.Dependency) std.Build.LazyPath {
-    const run = b.addRunArtifact(protoc_exe);
-    for ([_][]const u8{ "onnx-ml.proto", "onnx-operators-ml.proto", "onnx-data.proto" }) |proto| {
-        run.addFileArg(onnx.path(b.fmt("onnx/{s}", .{proto})));
-    }
-    run.addArg("-I");
-    run.addDirectoryArg(onnx.path(""));
-    run.addArg("--cpp_out");
-    return run.addOutputDirectoryArg("onnx-proto");
-}
 
 fn concatFlags(b: *std.Build, parts: []const []const []const u8) []const []const u8 {
     return std.mem.concat(b.allocator, []const u8, parts) catch @panic("OOM");
@@ -838,13 +533,6 @@ const ort_flags = ort_base_flags ++ [_][]const u8{
     "-DORT_NO_RTTI",
 };
 
-// OpenVINO's headers throw and catch by type, and its own build has RTTI on,
-// so the no-RTTI pair is omitted.
-//
-// -Wno-invalid-constexpr: glibc 2.41 dropped __CORRECT_ISO_CPP_MATH_H_PROTO,
-// so libstdc++'s <cmath> now declares its own constexpr acos(float) and friends
-// over __builtin_acosf. GCC folds those at compile time; clang does not, and
-// rejects the definitions outright rather than warning.
 const ort_openvino_flags = ort_base_flags ++ [_][]const u8{
     "-Wno-invalid-constexpr",
 };
@@ -860,7 +548,6 @@ const ort_c_flags = [_][]const u8{
     "-w",
 };
 
-/// Applied to every mlas ISA group, on top of `ort_flags`.
 const mlas_group_flags = [_][]const u8{
     "-fvisibility=hidden",
     "-fvisibility-inlines-hidden",

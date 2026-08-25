@@ -1,7 +1,3 @@
-//! Every source file the ONNX Runtime build compiles, listed out. These are
-//! the lists upstream keeps in CMake, transcribed once so that no CMake, no
-//! Python, and no configure step is needed to build the runtime.
-
 const std = @import("std");
 
 pub const protobuf_lite_sources = [_][]const u8{
@@ -189,21 +185,11 @@ const spin_pause_file = "core/common/spin_pause.cc";
 const spin_pause_waitpkg = [_]FileFlags{.{ .file = spin_pause_file, .flags = &.{"-mwaitpkg"} }};
 const spin_pause_plain = [_]FileFlags{.{ .file = spin_pause_file, .flags = &.{} }};
 
-/// Every list whose contents depend on the machine being built for. One switch,
-/// so an architecture is either described here in full or rejected outright.
 pub const TargetSources = struct {
     cpuinfo: []const []const u8,
-    /// The mlas sources written for this architecture, on top of
-    /// `ort_mlas_sources`.
     mlas: []const []const u8,
-    /// mlas translation units compiled against a raised ISA baseline.
     mlas_groups: []const MlasGroup,
     device_discovery: []const []const u8,
-    /// Sources needing flags of their own. Zig's addCSourceFiles appends rather
-    /// than overrides, so a file listed here must NOT also appear in a list
-    /// elsewhere in this file: both objects would land in the archive and the
-    /// linker would resolve against the first one added, silently discarding
-    /// the flags.
     file_flags: []const FileFlags,
 };
 
@@ -225,9 +211,6 @@ pub fn forTarget(target: std.Target) TargetSources {
             .mlas = &ort_mlas_x86_64_sources,
             .mlas_groups = &ort_mlas_x86_64_groups,
             .device_discovery = device_discovery,
-            // spin_pause.cc reaches for umonitor/umwait, which only assemble
-            // with -mwaitpkg; the instructions themselves stay behind a
-            // runtime check.
             .file_flags = &spin_pause_waitpkg,
         },
         .aarch64 => .{
@@ -834,9 +817,6 @@ pub const ort_flatbuffers_sources = [_][]const u8{
     "core/flatbuffers/flatbuffers_utils.cc",
 };
 
-// The standalone model package library, which lives beside the runtime in the
-// upstream tree and is linked into the session. Paths are relative to
-// model_package/, not to onnxruntime/.
 pub const model_package_sources = [_][]const u8{
     "src/asset_hasher.cc",
     "src/authoring.cc",
@@ -1163,8 +1143,6 @@ const ort_mlas_aarch64_sources = [_][]const u8{
     "core/mlas/lib/sqnbitgemm_kernel_neon_fp32.cpp",
 };
 
-/// Lowers an architecture's own feature enum to the untyped set `MlasGroup`
-/// carries, so that groups for either architecture share the one type.
 fn featureSet(comptime Feature: type, comptime features: []const Feature) std.Target.Cpu.Feature.Set {
     comptime {
         var set: std.Target.Cpu.Feature.Set = .empty;
@@ -1182,8 +1160,6 @@ fn arm(comptime features: []const std.Target.aarch64.Feature) std.Target.Cpu.Fea
 }
 
 pub const MlasGroup = struct {
-    /// The ISA baseline these files are compiled against, on top of the
-    /// target's own.
     features: std.Target.Cpu.Feature.Set,
     files: []const []const u8,
     flags: []const []const u8 = &.{},
@@ -1238,8 +1214,6 @@ const ort_mlas_x86_64_groups = [_]MlasGroup{
         },
     },
     .{
-        // The 2-bit dequant kernel keeps its multiply and add apart to stay
-        // bit-identical to the scalar kernel, so contraction is turned off.
         .features = x86(&.{ .avx2, .f16c, .fma }),
         .files = &.{
             "core/mlas/lib/intrinsics/avx2/q2_dq_avx2.cpp",
@@ -1247,8 +1221,6 @@ const ort_mlas_x86_64_groups = [_]MlasGroup{
         .flags = &.{"-ffp-contract=off"},
     },
     .{
-        // AVX-VNNI lives in a translation unit of its own so the vectorizer
-        // cannot slip a VNNI instruction into the plain AVX2 kernels.
         .features = x86(&.{ .avx2, .avxvnni, .f16c, .fma }),
         .files = &.{
             "core/mlas/lib/sqnbitgemm_kernel_avx2vnni.cpp",
@@ -1304,11 +1276,6 @@ const ort_mlas_x86_64_groups = [_]MlasGroup{
 
 const ort_mlas_aarch64_groups = [_]MlasGroup{
     .{
-        // All three reach for fp16 NEON arithmetic unconditionally, which a
-        // plain v8-a baseline does not assemble -- upstream compiles exactly
-        // these with -march=armv8.2-a+fp16. The kernels stay behind
-        // MlasFp16AccelerationSupported, so a machine without fp16 never
-        // reaches them.
         .features = arm(&.{.fullfp16}),
         .files = &.{
             "core/mlas/lib/activate_fp16.cpp",
@@ -1331,11 +1298,6 @@ const ort_mlas_aarch64_groups = [_]MlasGroup{
     },
 };
 
-// The OpenVINO execution provider, ORT's only route to an Intel NPU. These
-// go into a shared library of their own rather than into libonnxruntime.a:
-// ORT reaches an OpenVINO EP by dlopening it and calling CreateEpFactories,
-// and the .so in turn calls back into the runtime through the one symbol
-// Provider_GetHost. See `openvinoProvider` in build.zig.
 pub const ort_openvino_sources = [_][]const u8{
     "core/providers/openvino/backend_manager.cc",
     "core/providers/openvino/backend_utils.cc",
@@ -1361,20 +1323,11 @@ pub const ort_openvino_sources = [_][]const u8{
     "core/providers/openvino/qdq_transformations/qdq_stripping.cc",
 };
 
-// The provider side of the bridge: re-implements the runtime's internal C++
-// types (Node, GraphViewer, Tensor, ...) as forwarders onto the ProviderHost
-// vtable that Provider_GetHost hands back. Compiled into every provider .so,
-// never into the runtime itself.
 pub const ort_provider_shared_sources = [_][]const u8{
     "core/providers/shared_library/provider_bridge_provider.cc",
     "core/providers/shared_library/provider_ort_api_init.cc",
 };
 
-// The mailbox the two halves of the bridge meet in: one global ProviderHost
-// pointer, a setter and a getter. Upstream builds it as its own tiny shared
-// library, and so does build.zig, because that is what makes the pointer a
-// single object -- the runtime dlopens it and calls Provider_SetHost, every
-// provider .so links it and calls Provider_GetHost.
 pub const ort_provider_host_sources = [_][]const u8{
     "core/providers/shared/common.cc",
 };

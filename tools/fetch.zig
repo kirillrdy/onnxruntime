@@ -1,19 +1,3 @@
-//! Downloader behind `zig build fetch-openvino`, which pulls Intel's OpenVINO
-//! release into the build cache.
-//!
-//! It exists because that archive cannot be a `build.zig.zon` dependency: see
-//! `download` for what Zig's own HTTP client and `zig fetch` both run into
-//! against Intel's CDN. Everything else this package builds is a zon
-//! dependency, and would be here too if it could be.
-//!
-//! Usage:
-//!   fetch --url <url> --out <path> [--sha256 <hex>] [--label <text>] [--extract <dir>]
-//!
-//! With `--sha256` the download is verified and the file is only moved into
-//! place once it matches; an existing file that already matches is left alone.
-//! `--extract` unpacks it, and a destination that is already there is left
-//! alone the same way -- so the step is idempotent and cheap to re-run.
-
 const std = @import("std");
 
 const Options = struct {
@@ -21,9 +5,6 @@ const Options = struct {
     out: []const u8,
     sha256: ?[]const u8 = null,
     label: ?[]const u8 = null,
-    /// Where to unpack `out`, for a download that is an archive rather than a
-    /// file to be used as it is. The top-level directory the archive carries
-    /// its own version in is stripped, so this directory *is* the archive.
     extract: ?[]const u8 = null,
 };
 
@@ -111,12 +92,6 @@ pub fn main(init: std.process.Init) !void {
     try unpack(gpa, io, opts, name);
 }
 
-/// Unpack `opts.out` into `opts.extract`, if this download is an archive.
-///
-/// Idempotent the same way the download is: the destination existing is what
-/// says the work was done, so re-running the step costs a stat. The archive is
-/// unpacked beside it and renamed into place, so an interrupted run leaves no
-/// half-populated directory to be mistaken for a finished one.
 fn unpack(gpa: std.mem.Allocator, io: std.Io, opts: Options, name: []const u8) !void {
     const dest = opts.extract orelse return;
     const cwd = std.Io.Dir.cwd();
@@ -141,8 +116,6 @@ fn unpack(gpa: std.mem.Allocator, io: std.Io, opts: Options, name: []const u8) !
     defer gpa.free(read_buf);
     var archive_reader = archive.reader(io, read_buf);
 
-    // Zig's inflate wants the whole 64 KiB window up front; without it the
-    // decompressor has nowhere to resolve back-references from.
     const window = try gpa.alloc(u8, std.compress.flate.max_window_len);
     defer gpa.free(window);
     var gzip: std.compress.flate.Decompress = .init(&archive_reader.interface, .gzip, window);
@@ -150,8 +123,6 @@ fn unpack(gpa: std.mem.Allocator, io: std.Io, opts: Options, name: []const u8) !
     var dir = try cwd.openDir(io, part, .{});
     defer dir.close(io);
 
-    // One component stripped: the archive carries its own build number as a
-    // top-level directory, and nothing downstream should have to know it.
     try std.tar.extract(io, dir, &gzip.reader, .{ .strip_components = 1 });
 
     try cwd.rename(part, cwd, dest, io);
@@ -165,13 +136,6 @@ fn fileExists(io: std.Io, path: []const u8) bool {
     return true;
 }
 
-/// curl first, Zig's own client second.
-///
-/// Not the order the file's name suggests, and deliberate: `std.http.Client`
-/// cannot reach the host this fetches from. Its TLS fails the handshake against
-/// the post-quantum key exchange (X25519MLKEM768) that Intel's CDN negotiates,
-/// which is the same reason the archive cannot be a `build.zig.zon` dependency
-/// -- `zig fetch` fails there too. The fallback is kept for the day that lands.
 fn download(gpa: std.mem.Allocator, io: std.Io, opts: Options, dest_path: []const u8) !void {
     downloadWithCurl(gpa, io, opts, dest_path) catch {
         return downloadZig(gpa, io, opts, dest_path);
@@ -216,7 +180,6 @@ fn downloadZig(gpa: std.mem.Allocator, io: std.Io, opts: Options, dest_path: []c
     }
 }
 
-/// SHA-256 of a file as lowercase hex, or null when the file does not exist.
 fn hashFile(io: std.Io, path: []const u8) !?[64]u8 {
     const cwd = std.Io.Dir.cwd();
     var file = cwd.openFile(io, path, .{}) catch |err| switch (err) {
