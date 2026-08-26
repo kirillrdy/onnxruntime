@@ -320,7 +320,6 @@ pub const coreml_proto_generated_sources = [_][]const u8{
 };
 
 pub const ort_coreml_sources = [_][]const u8{
-    "core/providers/coreml/builders/helper.cc",
     "core/providers/coreml/builders/impl/LRN_op_builder.cc",
     "core/providers/coreml/builders/impl/activation_op_builder.cc",
     "core/providers/coreml/builders/impl/argmax_op_builder.cc",
@@ -346,7 +345,6 @@ pub const ort_coreml_sources = [_][]const u8{
     "core/providers/coreml/builders/impl/pool_op_builder.cc",
     "core/providers/coreml/builders/impl/quick_gelu_op_builder.cc",
     "core/providers/coreml/builders/impl/reduction_op_builder.cc",
-    "core/providers/coreml/builders/impl/reshape_op_builder.cc",
     "core/providers/coreml/builders/impl/resize_op_builder.cc",
     "core/providers/coreml/builders/impl/shape_op_builder.cc",
     "core/providers/coreml/builders/impl/slice_op_builder.cc",
@@ -354,9 +352,7 @@ pub const ort_coreml_sources = [_][]const u8{
     "core/providers/coreml/builders/impl/split_op_builder.cc",
     "core/providers/coreml/builders/impl/squeeze_op_builder.cc",
     "core/providers/coreml/builders/impl/tile_op_builder.cc",
-    "core/providers/coreml/builders/impl/transpose_op_builder.cc",
     "core/providers/coreml/builders/impl/where_op_builder.cc",
-    "core/providers/coreml/builders/model_builder.cc",
     "core/providers/coreml/builders/op_builder_factory.cc",
     "core/providers/coreml/coreml_execution_provider.cc",
     "core/providers/coreml/coreml_options.cc",
@@ -366,6 +362,10 @@ pub const ort_coreml_sources = [_][]const u8{
 };
 
 pub const ort_coreml_override_sources = [_][]const u8{
+    "coreml/helper.cc",
+    "coreml/model_builder.cc",
+    "coreml/reshape_op_builder.cc",
+    "coreml/transpose_op_builder.cc",
     "coreml/unary_op_builder.cc",
 };
 
