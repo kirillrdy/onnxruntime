@@ -7,6 +7,9 @@
         "build.zig",
         "build.zig.zon",
         "sources.zig",
+        "openvino_sources.zig",
+        "openvino_onnx_sources.zig",
+        "openvino-compat",
         "coreml",
         "tools",
         "README.md",
@@ -79,6 +82,26 @@
         .fp16 = .{
             .url = "https://github.com/Maratyszcza/FP16/archive/0a92994d729ff76a58f692d3028ca1b64b145d91.zip",
             .hash = "N-V-__8AAPRiBwBHv9btEWjPRJO11PX1lgrFYE4i4sw3iA8W",
+        },
+        .openvino = .{
+            .url = "https://github.com/openvinotoolkit/openvino/archive/refs/tags/2026.3.0.tar.gz",
+            .hash = "N-V-__8AAGIRfAt-Du8FHkwshcLBZb6TLFmcsFEB-MCdJ4eN",
+        },
+        .openvino_pugixml = .{
+            .url = "https://github.com/zeux/pugixml/archive/ee86beb30e4973f5feffe3ce63bfa4fbadf72f38.tar.gz",
+            .hash = "N-V-__8AADXtKQAiMpWWNo5TPa37aXJx68JYsJq5gfycIjE_",
+        },
+        .openvino_ittapi = .{
+            .url = "https://github.com/intel/ittapi/archive/ca45fef1a12cef3316e6ff362a4d36571270e392.tar.gz",
+            .hash = "N-V-__8AALe8GgAdkgbHhg5Zk_48SolfYkJxFlcGE5oC-TYj",
+        },
+        .openvino_xbyak = .{
+            .url = "https://github.com/herumi/xbyak/archive/0d67fd1530016b7c56f3cd74b3fca920f4c3e2b4.tar.gz",
+            .hash = "N-V-__8AAA6LFAAc9INBb0zr5xlQlzIdM_y-gLUXg-V6I8xE",
+        },
+        .openvino_opencl_hpp = .{
+            .url = "https://github.com/KhronosGroup/OpenCL-CLHPP/archive/c7b4aded1cab9560b226041dd962f63375a9a384.tar.gz",
+            .hash = "N-V-__8AAPpuDADFUs86CkySaBmqIB4YWT8uLph3auWHLn6V",
         },
     },
 }

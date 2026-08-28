@@ -26,14 +26,20 @@ exe.root_module.linkLibrary(ort.artifact("onnxruntime"));
 
 ## OpenVINO
 
-Enable the Intel NPU/GPU provider with `zig build -Dopenvino`. The build
-downloads its pinned OpenVINO release automatically.
+Enable the Intel GPU provider with `zig build -Dopenvino=true`. OpenVINO, its
+GPU plugin, and the OpenCL ICD loader are built from pinned source dependencies.
+The source build currently supports native x86-64 Linux targets.
 
-Consumers must call `linkStdCxx`, install `onnxruntime_providers_shared` beside
-the executable, and install `OpenCL` when using the GPU. Use
-`addOpenVinoRuntimeEnvironment` to configure the run step:
+The GPU plugin reads its OpenCL kernels out of generated `.inc` databases.
+`tools/cl_kernel_db.zig` builds them during the build, from the pinned OpenVINO
+sources; it is a port of the two Python scripts OpenVINO's CMake build uses for
+the same job, so the build still needs nothing but Zig.
+
+Consumers must install `onnxruntime_providers_shared` and
+`onnxruntime_providers_openvino` beside the executable. Use
+`addOpenVinoRuntimeEnvironment` to expose the built libraries and configure an
+optional Intel OpenCL driver for the run step:
 
 ```zig
-onnxruntime.linkStdCxx(b, exe.root_module);
 onnxruntime.addOpenVinoRuntimeEnvironment(b, run, .gpu, extra, known, null);
 ```
