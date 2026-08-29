@@ -11,7 +11,7 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("tools/fetch.zig"),
             .target = b.graph.host,
-            .optimize = .Debug,
+            .optimize = optimize,
         }),
     });
     const archive = b.cache_root.join(b.allocator, &.{ "onnxruntime", openvino_archive }) catch @panic("OOM");
@@ -330,7 +330,7 @@ const Parts = struct {
 
         const protoc_mod = b.createModule(.{
             .target = b.graph.host,
-            .optimize = .ReleaseSmall,
+            .optimize = optimize,
             .link_libc = true,
             .link_libcpp = true,
         });
