@@ -1,7 +1,6 @@
 const std = @import("std");
 const sources = @import("sources.zig");
 const openvino_sources = @import("openvino_sources.zig");
-const openvino_onnx_sources = @import("openvino_onnx_sources.zig");
 const build_zon = @import("build.zig.zon");
 
 pub fn build(b: *std.Build) void {
@@ -18,8 +17,6 @@ pub fn build(b: *std.Build) void {
         std.process.exit(1);
     }
 
-    const native_openvino = if (openvino) buildOpenVino(b, target, optimize) else null;
-
     const parts = Parts.init(b, target, optimize, openvino);
     b.installArtifact(parts.runtime());
     if (parts.openvino) {
@@ -30,7 +27,6 @@ pub fn build(b: *std.Build) void {
             .files = &sources.ort_provider_host_sources,
             .flags = parts.flags,
         });
-        parts.linkCxx(shared_mod);
         const shared = b.addLibrary(.{
             .name = "onnxruntime_providers_shared",
             .linkage = .dynamic,
@@ -43,10 +39,6 @@ pub fn build(b: *std.Build) void {
         provider_mod.addIncludePath(parts.protos);
         provider_mod.addIncludePath(openvino_dep.path(""));
         provider_mod.addIncludePath(b.path("openvino-compat"));
-        provider_mod.addIncludePath(openvino_dep.path("src/core/include"));
-        provider_mod.addIncludePath(openvino_dep.path("src/inference/include"));
-        provider_mod.addIncludePath(openvino_dep.path("src/frontends/common/include"));
-        provider_mod.addIncludePath(openvino_dep.path("src/frontends/onnx/frontend/include"));
         provider_mod.addIncludePath(openvino_dep.path("src/frontends/onnx/frontend/src"));
         provider_mod.addIncludePath(openvino_dep.path("src/frontends/onnx/onnx_common/include"));
         provider_mod.addIncludePath(openvino_dep.path("src/frontends/onnx/onnx_common/src"));
@@ -66,11 +58,10 @@ pub fn build(b: *std.Build) void {
         provider_mod.addCSourceFiles(.{ .root = parts.protos, .files = &sources.onnx_proto_sources, .flags = provider_flags });
         provider_mod.addCSourceFiles(.{ .root = parts.protobuf.path(""), .files = &sources.protobuf_lite_sources, .flags = provider_flags });
         provider_mod.addCSourceFiles(.{ .root = parts.abseil.path(""), .files = &sources.abseil_sources, .flags = provider_flags });
-        addOpenVinoGroup(b, provider_mod, openvino_dep, &openvino_onnx_sources.common, &openvino_onnx_frontend_flags);
-        addOpenVinoGroup(b, provider_mod, openvino_dep, &openvino_onnx_sources.frontend, &openvino_onnx_frontend_flags);
-        provider_mod.linkLibrary(native_openvino.?.runtime);
-        provider_mod.linkLibrary(native_openvino.?.opencl);
-        parts.linkCxx(provider_mod);
+        addOpenVinoGroup(b, provider_mod, openvino_dep, &openvino_sources.openvino_onnx_common, &openvino_onnx_frontend_flags);
+        addOpenVinoGroup(b, provider_mod, openvino_dep, &openvino_sources.openvino_onnx_frontend, &openvino_onnx_frontend_flags);
+        provider_mod.linkLibrary(buildOpenVino(b, openvino_dep, target, optimize));
+        provider_mod.linkLibrary(buildOpenCl(b, target, optimize));
         const provider = b.addLibrary(.{
             .name = "onnxruntime_providers_openvino",
             .linkage = .dynamic,
@@ -91,12 +82,8 @@ pub fn library(
     return Parts.init(b, target, optimize, false).runtime();
 }
 
-pub fn linkStdCxx(_: *std.Build, _: *std.Build.Module) void {}
-
 pub fn openvinoRuntimeLibraryPaths(b: *std.Build) []const []const u8 {
-    const paths = b.allocator.alloc([]const u8, 1) catch @panic("OOM");
-    paths[0] = b.getInstallPath(.lib, "");
-    return paths;
+    return b.allocator.dupe([]const u8, &.{b.getInstallPath(.lib, "")}) catch @panic("OOM");
 }
 
 pub const OpenVinoDevice = enum { npu, gpu, cpu };
@@ -178,11 +165,6 @@ fn hasLibrary(b: *std.Build, dir: []const u8, library_name: []const u8) bool {
     return true;
 }
 
-const NativeOpenVino = struct {
-    runtime: *std.Build.Step.Compile,
-    opencl: *std.Build.Step.Compile,
-};
-
 fn buildOpenCl(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
@@ -225,65 +207,38 @@ fn buildOpenCl(
     return opencl;
 }
 
-fn addOpenVinoIncludes(
-    b: *std.Build,
-    mod: *std.Build.Module,
-    ov: *std.Build.Dependency,
-    generated_plugins: std.Build.LazyPath,
-    kernel_db: KernelDb,
-) void {
-    mod.addIncludePath(ov.path(""));
-    for (openvino_include_dirs) |dir| mod.addIncludePath(ov.path(dir));
-    mod.addIncludePath(generated_plugins);
-    mod.addIncludePath(b.path("openvino-compat"));
-    mod.addIncludePath(kernel_db.kernel_selector);
-    mod.addIncludePath(kernel_db.ocl_v2);
-    mod.addIncludePath(b.dependency("json", .{}).path("single_include"));
-    mod.addIncludePath(b.dependency("openvino_pugixml", .{}).path("src"));
-    mod.addIncludePath(b.dependency("openvino_ittapi", .{}).path("include"));
-    mod.addIncludePath(b.dependency("openvino_ittapi", .{}).path("src/ittnotify"));
-    mod.addIncludePath(b.dependency("openvino_xbyak", .{}).path(""));
-    mod.addIncludePath(b.dependency("opencl_headers", .{}).path(""));
-    mod.addIncludePath(b.dependency("openvino_opencl_hpp", .{}).path("include"));
-}
-
-const KernelDb = struct {
-    /// Holds ks_primitive_db.inc and ks_primitive_db_batch_headers.inc.
-    kernel_selector: std.Build.LazyPath,
-    /// Holds gpu_ocl_kernel_sources.inc and gpu_ocl_kernel_headers.inc.
-    ocl_v2: std.Build.LazyPath,
-};
-
 /// Stringifies the GPU plugin's OpenCL kernels into the `.inc` databases its
 /// sources `#include`. OpenVINO's CMake build generates these with two Python
 /// scripts; `tools/cl_kernel_db.zig` is a port of them, so the databases come
 /// out of the pinned sources rather than a snapshot that can drift from them.
-fn buildKernelDb(b: *std.Build, ov: *std.Build.Dependency) KernelDb {
+fn addKernelDb(
+    b: *std.Build,
+    mod: *std.Build.Module,
+    ov: *std.Build.Dependency,
+    optimize: std.builtin.OptimizeMode,
+) void {
     const generator = b.addExecutable(.{
         .name = "cl_kernel_db",
         .root_module = b.createModule(.{
             .root_source_file = b.path("tools/cl_kernel_db.zig"),
             .target = b.graph.host,
-            .optimize = .ReleaseFast,
+            .optimize = optimize,
         }),
     });
-
     const kernels = ov.path("src/plugins/intel_gpu/src/kernel_selector/cl_kernels");
 
+    // ks_primitive_db.inc and ks_primitive_db_batch_headers.inc
     const primitive_db = b.addRunArtifact(generator);
     primitive_db.addArg("primitive-db");
     primitive_db.addDirectoryArg(kernels);
-    const kernel_selector = primitive_db.addOutputDirectoryArg("kernel_selector");
+    mod.addIncludePath(primitive_db.addOutputDirectoryArg("kernel_selector"));
 
+    // gpu_ocl_kernel_sources.inc and gpu_ocl_kernel_headers.inc
     const ocl_v2 = b.addRunArtifact(generator);
     ocl_v2.addArg("ocl-v2");
     ocl_v2.addDirectoryArg(ov.path("src/plugins/intel_gpu/src/graph/impls/ocl_v2"));
     ocl_v2.addDirectoryArg(kernels.path(b, "include"));
-
-    return .{
-        .kernel_selector = kernel_selector,
-        .ocl_v2 = ocl_v2.addOutputDirectoryArg("ocl_v2"),
-    };
+    mod.addIncludePath(ocl_v2.addOutputDirectoryArg("ocl_v2"));
 }
 
 fn addOpenVinoGroup(
@@ -302,13 +257,12 @@ fn addOpenVinoGroup(
 
 fn buildOpenVino(
     b: *std.Build,
+    ov: *std.Build.Dependency,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
-) NativeOpenVino {
-    const ov = b.dependency("openvino", .{});
-    const opencl = buildOpenCl(b, target, optimize);
+) *std.Build.Step.Compile {
     const generated = b.addWriteFiles();
-    const plugins_header = generated.add("ov_plugins.hpp", openvino_plugins_header);
+    _ = generated.add("ov_plugins.hpp", openvino_plugins_header);
     _ = generated.add("ov_frontends.hpp", openvino_frontends_header);
 
     const runtime_mod = b.createModule(.{
@@ -317,15 +271,25 @@ fn buildOpenVino(
         .link_libc = true,
         .link_libcpp = true,
     });
-    addOpenVinoIncludes(b, runtime_mod, ov, plugins_header.dirname(), buildKernelDb(b, ov));
+    runtime_mod.addIncludePath(ov.path(""));
+    for (openvino_include_dirs) |dir| runtime_mod.addIncludePath(ov.path(dir));
+    runtime_mod.addIncludePath(generated.getDirectory());
+    runtime_mod.addIncludePath(b.path("openvino-compat"));
+    runtime_mod.addIncludePath(b.dependency("json", .{}).path("single_include"));
+    runtime_mod.addIncludePath(b.dependency("openvino_pugixml", .{}).path("src"));
+    runtime_mod.addIncludePath(b.dependency("openvino_ittapi", .{}).path("include"));
+    runtime_mod.addIncludePath(b.dependency("openvino_ittapi", .{}).path("src/ittnotify"));
+    runtime_mod.addIncludePath(b.dependency("openvino_xbyak", .{}).path(""));
+    runtime_mod.addIncludePath(b.dependency("opencl_headers", .{}).path(""));
+    runtime_mod.addIncludePath(b.dependency("openvino_opencl_hpp", .{}).path("include"));
+    addKernelDb(b, runtime_mod, ov, optimize);
     runtime_mod.linkSystemLibrary("dl", .{});
 
     addOpenVinoGroup(b, runtime_mod, ov, &openvino_sources.openvino_core_obj, &openvino_core_flags);
-    addOpenVinoGroup(b, runtime_mod, ov, &openvino_sources.openvino_core_obj_version, &openvino_core_version_flags);
     addOpenVinoGroup(b, runtime_mod, ov, &openvino_sources.openvino_frontend_common_obj, &openvino_frontend_flags);
     addOpenVinoGroup(b, runtime_mod, ov, &openvino_sources.openvino_transformations_obj, &openvino_api_flags);
     addOpenVinoGroup(b, runtime_mod, ov, &openvino_sources.openvino_lp_transformations_obj, &openvino_api_flags);
-    addOpenVinoGroup(b, runtime_mod, ov, &openvino_sources.openvino_runtime_obj, &openvino_runtime_flags);
+    addOpenVinoGroup(b, runtime_mod, ov, &openvino_sources.openvino_runtime_obj, &.{"-DIMPLEMENT_OPENVINO_RUNTIME_API"});
     addOpenVinoGroup(b, runtime_mod, ov, &openvino_sources.openvino_reference, &openvino_reference_flags);
     addOpenVinoGroup(b, runtime_mod, ov, &openvino_sources.openvino_shape_inference, &openvino_core_internal_flags);
     addOpenVinoGroup(b, runtime_mod, ov, &openvino_sources.openvino_itt, &.{});
@@ -357,10 +321,9 @@ fn buildOpenVino(
         &openvino_sources.openvino_intel_gpu_ocl_v2_obj,
         &openvino_sources.openvino_intel_gpu_runtime,
     }) |files| addOpenVinoGroup(b, runtime_mod, ov, files, &openvino_gpu_flags);
-    addOpenVinoGroup(b, runtime_mod, ov, &openvino_sources.openvino_intel_gpu_plugin, &openvino_gpu_static_plugin_flags);
-    addOpenVinoGroup(b, runtime_mod, ov, &openvino_sources.openvino_intel_gpu_plugin_version, &openvino_gpu_static_plugin_version_flags);
+    addOpenVinoGroup(b, runtime_mod, ov, &openvino_sources.openvino_intel_gpu_plugin, &openvino_gpu_plugin_flags);
 
-    const runtime = b.addLibrary(.{
+    return b.addLibrary(.{
         .name = "openvino",
         // OpenVINO's C++ API passes ov::Any and STL objects across its API.
         // Zig statically embeds libc++, so a separate runtime DSO creates a
@@ -368,8 +331,6 @@ fn buildOpenVino(
         .linkage = .static,
         .root_module = runtime_mod,
     });
-
-    return .{ .runtime = runtime, .opencl = opencl };
 }
 
 const Parts = struct {
@@ -518,8 +479,6 @@ const Parts = struct {
         for (self.includes) |include| mod.addIncludePath(include);
         return mod;
     }
-
-    fn linkCxx(_: Parts, _: *std.Build.Module) void {}
 
     fn runtime(self: Parts) *std.Build.Step.Compile {
         const b = self.b;
@@ -684,17 +643,18 @@ const openvino_include_dirs = [_][]const u8{
     "src/plugins/intel_gpu/thirdparty",
 };
 
+const openvino_version = "2026.3.0";
+
 const openvino_common_flags = [_][]const u8{
     "-std=c++17",
     "-includeopenvino_itt_compat.hpp",
-    "-DOpenVINO_VERSION=\"2026.3.0\"",
+    "-DOpenVINO_VERSION=\"" ++ openvino_version ++ "\"",
+    // Read by version.cpp and the GPU plugin.cpp only.
+    "-DCI_BUILD_NUMBER=\"" ++ openvino_version ++ "-1-8a17657b995\"",
     "-DIN_OV_COMPONENT",
     "-DOV_BUILD_POSTFIX=\"\"",
-    "-DOV_NATIVE_PARENT_PROJECT_ROOT_DIR=\"openvino-2026.3.0\"",
+    "-DOV_NATIVE_PARENT_PROJECT_ROOT_DIR=\"openvino-" ++ openvino_version ++ "\"",
     "-DOV_THREAD=OV_THREAD_SEQ",
-    // Keep Zig's C++ cache from reusing objects produced before the
-    // OpenVINO ITT compatibility shim was applied to the source tree.
-    "-DOV_ZIG_SOURCE_BUILD=3",
     "-fsigned-char",
     "-fno-sanitize=undefined",
     "-w",
@@ -705,9 +665,6 @@ const openvino_core_internal_flags = [_][]const u8{"-DIN_OV_CORE_LIBRARY"};
 const openvino_core_flags = openvino_api_flags ++ openvino_core_internal_flags ++ [_][]const u8{
     "-DXBYAK64",
     "-DXBYAK_NO_OP_NAMES",
-};
-const openvino_core_version_flags = openvino_core_flags ++ [_][]const u8{
-    "-DCI_BUILD_NUMBER=\"2026.3.0-1-8a17657b995\"",
 };
 const openvino_frontend_flags = openvino_api_flags ++ [_][]const u8{
     "-DOPENVINO_STATIC_LIBRARY",
@@ -722,7 +679,6 @@ const openvino_onnx_frontend_flags = [_][]const u8{
     "-Dget_front_end_data=get_front_end_data_onnx",
     "-Dget_api_version=get_api_version_onnx",
 };
-const openvino_runtime_flags = [_][]const u8{"-DIMPLEMENT_OPENVINO_RUNTIME_API"};
 const openvino_reference_flags = openvino_core_internal_flags ++ [_][]const u8{
     "-DHAVE_AVX2",
     "-DXBYAK64",
@@ -737,15 +693,7 @@ const openvino_gpu_flags = [_][]const u8{
 };
 const openvino_gpu_plugin_flags = openvino_gpu_flags ++ [_][]const u8{
     "-DIMPLEMENT_OPENVINO_RUNTIME_PLUGIN",
-};
-const openvino_gpu_plugin_version_flags = openvino_gpu_plugin_flags ++ [_][]const u8{
-    "-DCI_BUILD_NUMBER=\"2026.3.0-1-8a17657b995\"",
-};
-const openvino_gpu_static_plugin_flags = openvino_gpu_plugin_flags ++ [_][]const u8{
     "-DOV_CREATE_PLUGIN=create_plugin_engine_GPU",
-};
-const openvino_gpu_static_plugin_version_flags = openvino_gpu_static_plugin_flags ++ [_][]const u8{
-    "-DCI_BUILD_NUMBER=\"2026.3.0-1-8a17657b995\"",
 };
 
 const openvino_plugins_header =

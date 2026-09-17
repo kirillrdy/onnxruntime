@@ -8,7 +8,6 @@
         "build.zig.zon",
         "sources.zig",
         "openvino_sources.zig",
-        "openvino_onnx_sources.zig",
         "openvino-compat",
         "coreml",
         "tools",

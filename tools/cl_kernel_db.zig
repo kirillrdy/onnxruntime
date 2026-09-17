@@ -74,44 +74,37 @@ fn writeOutput(io: std.Io, out_dir: []const u8, name: []const u8, data: []const 
 // Python string and regex primitives
 // ---------------------------------------------------------------------------
 
-/// The character class Python's `\s` matches for byte strings.
-fn isSpace(c: u8) bool {
-    return c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == 0x0b or c == 0x0c;
-}
-
-/// `[^\S\n]`: whitespace that is not a line break.
-fn isHSpace(c: u8) bool {
-    return isSpace(c) and c != '\n';
-}
+/// The character class Python's `\s` matches for byte strings; identical to
+/// `std.ascii.whitespace`.
+const isSpace = std.ascii.isWhitespace;
 
 /// The character class Python's `\w` matches for byte strings.
 fn isWord(c: u8) bool {
-    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
-        (c >= '0' and c <= '9') or c == '_';
+    return std.ascii.isAlphanumeric(c) or c == '_';
 }
 
-const space_chars = " \t\n\r\x0b\x0c";
-
 fn strip(s: []const u8) []const u8 {
-    return std.mem.trim(u8, s, space_chars);
+    return std.mem.trim(u8, s, &std.ascii.whitespace);
 }
 
 fn rstrip(s: []const u8) []const u8 {
-    return std.mem.trimEnd(u8, s, space_chars);
+    return std.mem.trimEnd(u8, s, &std.ascii.whitespace);
 }
 
 /// End of the `\s*` run starting at `i`.
 fn skipSpace(s: []const u8, i: usize) usize {
-    var j = i;
-    while (j < s.len and isSpace(s[j])) j += 1;
-    return j;
+    return std.mem.findNonePos(u8, s, i, &std.ascii.whitespace) orelse s.len;
 }
 
-/// End of the `[^\S\n]*` run starting at `i`.
+/// End of the `\s+` run starting at `i`, or null when there is none.
+fn skipSpace1(s: []const u8, i: usize) ?usize {
+    const j = skipSpace(s, i);
+    return if (j == i) null else j;
+}
+
+/// End of the `[^\S\n]*` run starting at `i`: whitespace short of a line break.
 fn skipHSpace(s: []const u8, i: usize) usize {
-    var j = i;
-    while (j < s.len and isHSpace(s[j])) j += 1;
-    return j;
+    return std.mem.findNonePos(u8, s, i, " \t\r\x0b\x0c") orelse s.len;
 }
 
 /// End of the `\w*` run starting at `i`.
@@ -138,16 +131,6 @@ fn startsWithAt(s: []const u8, i: usize, needle: []const u8) bool {
     return i + needle.len <= s.len and std.mem.eql(u8, s[i..][0..needle.len], needle);
 }
 
-/// Python `str.splitlines()`: no trailing empty element for a trailing newline.
-fn splitLines(gpa: Allocator, s: []const u8) ![][]const u8 {
-    var out: List = .empty;
-    if (s.len == 0) return out.toOwnedSlice(gpa);
-    var it = std.mem.splitScalar(u8, s, '\n');
-    while (it.next()) |line| try out.append(gpa, line);
-    if (out.items[out.items.len - 1].len == 0) _ = out.pop();
-    return out.toOwnedSlice(gpa);
-}
-
 /// Python `str.split("\n")`: keeps the trailing empty element.
 fn splitRaw(gpa: Allocator, s: []const u8) ![][]const u8 {
     var out: List = .empty;
@@ -156,47 +139,24 @@ fn splitRaw(gpa: Allocator, s: []const u8) ![][]const u8 {
     return out.toOwnedSlice(gpa);
 }
 
-/// Python `file.readlines()`: every element keeps its own line break.
-fn readLines(gpa: Allocator, s: []const u8) ![][]const u8 {
-    var out: List = .empty;
-    var i: usize = 0;
-    while (i < s.len) {
-        if (std.mem.indexOfScalarPos(u8, s, i, '\n')) |nl| {
-            try out.append(gpa, s[i .. nl + 1]);
-            i = nl + 1;
-        } else {
-            try out.append(gpa, s[i..]);
-            i = s.len;
-        }
-    }
-    return out.toOwnedSlice(gpa);
+/// Python `str.splitlines()`: no trailing empty element for a trailing newline.
+fn splitLines(gpa: Allocator, s: []const u8) ![][]const u8 {
+    const lines = try splitRaw(gpa, s);
+    return if (lines[lines.len - 1].len == 0) lines[0 .. lines.len - 1] else lines;
 }
 
 fn joinLines(gpa: Allocator, parts: []const []const u8) ![]const u8 {
     return std.mem.join(gpa, "\n", parts);
 }
 
-/// Drops the elements Python's `if s` filter drops: empty strings only.
-fn dropEmptyLines(gpa: Allocator, s: []const u8) ![]const u8 {
+/// Drops empty lines, per Python's `if line` filter, or with `stripped` the
+/// lines that are empty once stripped, per `if line.strip()`.
+fn dropLines(gpa: Allocator, s: []const u8, comptime stripped: bool) ![]const u8 {
     var kept: List = .empty;
     for (try splitLines(gpa, s)) |line| {
-        if (line.len != 0) try kept.append(gpa, line);
+        if ((if (stripped) strip(line) else line).len != 0) try kept.append(gpa, line);
     }
     return joinLines(gpa, kept.items);
-}
-
-/// Drops lines that are empty once stripped, per `if line.strip()`.
-fn dropBlankLines(gpa: Allocator, s: []const u8) ![]const u8 {
-    var kept: List = .empty;
-    for (try splitLines(gpa, s)) |line| {
-        if (strip(line).len != 0) try kept.append(gpa, line);
-    }
-    return joinLines(gpa, kept.items);
-}
-
-fn stem(path: []const u8) []const u8 {
-    const base = std.fs.path.basename(path);
-    return base[0 .. std.mem.lastIndexOfScalar(u8, base, '.') orelse base.len];
 }
 
 fn readFile(gpa: Allocator, io: std.Io, path: []const u8) ![]u8 {
@@ -241,15 +201,9 @@ fn detectGuardPatterns(gpa: Allocator, content: []const u8) !Set {
         // `if\s+!\s*defined\s+(\w+)`.
         var parenthesised = false;
         if (startsWithAt(content, p, "ifndef")) {
-            p += "ifndef".len;
-            const after = skipSpace(content, p);
-            if (after == p) continue;
-            p = after;
+            p = skipSpace1(content, p + "ifndef".len) orelse continue;
         } else if (startsWithAt(content, p, "if")) {
-            p += "if".len;
-            const after_if = skipSpace(content, p);
-            if (after_if == p) continue;
-            p = after_if;
+            p = skipSpace1(content, p + "if".len) orelse continue;
             if (p >= content.len or content[p] != '!') continue;
             p = skipSpace(content, p + 1);
             if (!startsWithAt(content, p, "defined")) continue;
@@ -259,8 +213,7 @@ fn detectGuardPatterns(gpa: Allocator, content: []const u8) !Set {
                 parenthesised = true;
                 p = skipSpace(content, after_defined + 1);
             } else {
-                if (after_defined == p) continue;
-                p = after_defined;
+                p = skipSpace1(content, p) orelse continue;
             }
         } else continue;
 
@@ -281,10 +234,7 @@ fn detectGuardPatterns(gpa: Allocator, content: []const u8) !Set {
         if (p >= content.len or content[p] != '#') continue;
         p = skipSpace(content, p + 1);
         if (!startsWithAt(content, p, "define")) continue;
-        p += "define".len;
-        const after_define = skipSpace(content, p);
-        if (after_define == p) continue;
-        p = after_define;
+        p = skipSpace1(content, p + "define".len) orelse continue;
 
         const second_end = skipWord(content, p);
         if (second_end == p) continue;
@@ -301,8 +251,8 @@ fn detectGuardPatterns(gpa: Allocator, content: []const u8) !Set {
 // primitive_db_gen.py
 // ---------------------------------------------------------------------------
 
-const banner_prefix = "// This file is autogenerated by tools/cl_kernel_db.zig, a port of ";
-const banner_suffix = "; all changes to this file will be undone\n\n";
+const banner = "// This file is autogenerated by tools/cl_kernel_db.zig, a port of " ++
+    "primitive_db_gen.py; all changes to this file will be undone\n\n";
 
 /// Chunk limits shared by both of this script's emitters. A raw string literal
 /// has an implementation-defined length limit, so long kernels are split across
@@ -336,7 +286,7 @@ const PrimitiveDb = struct {
             var set: Set = .empty;
             try set.put(gpa, name, {});
             const path = try std.fs.path.join(gpa, &.{ dir, name });
-            for (try readLines(gpa, try readFile(gpa, self.io, path))) |line| {
+            for (try splitLines(gpa, try readFile(gpa, self.io, path))) |line| {
                 if (!std.mem.startsWith(u8, line, "#include")) continue;
                 try set.put(gpa, try includeTarget(line), {});
             }
@@ -380,7 +330,7 @@ const PrimitiveDb = struct {
         var res: Buf = .empty;
         var optimize_includes = true;
 
-        for (try readLines(gpa, try readFile(gpa, self.io, path))) |line| {
+        for (try splitLines(gpa, try readFile(gpa, self.io, path))) |line| {
             if (std.mem.startsWith(u8, line, "#pragma")) {
                 if (std.mem.indexOf(u8, line, "enable_includes_optimization") != null) {
                     optimize_includes = true;
@@ -405,7 +355,11 @@ const PrimitiveDb = struct {
             try res.append(gpa, '\n');
         }
 
-        if (std.mem.eql(u8, path, origin)) return reduceMacros(gpa, res.items);
+        // The origin also goes through `reduce_macros`, which is meant to drop
+        // `#define`s that nothing uses. Its liveness test scans the `#define`
+        // line itself, which always names the macro, so it never drops a line;
+        // its rstrip-and-rejoin has already happened above, and the extra
+        // trailing newline it adds is dropped again by `postProcessSources`.
         return res.items;
     }
 
@@ -426,7 +380,7 @@ const PrimitiveDb = struct {
         const content = try readFile(gpa, self.io, path);
         const guards = try detectGuardPatterns(gpa, content);
 
-        for (try readLines(gpa, content)) |line| {
+        for (try splitLines(gpa, content)) |line| {
             if (std.mem.indexOf(u8, line, "#define") != null) {
                 try emitUndef(gpa, &res, guards, try spaceField(strip(line), 1));
             }
@@ -449,7 +403,7 @@ const PrimitiveDb = struct {
         try self.include_files.put(gpa, path, .empty);
 
         var res: Buf = .empty;
-        try res.print(gpa, "{{\"{s}\",\n(std::string) R\"__krnl(\n", .{stem(path)});
+        try res.print(gpa, "{{\"{s}\",\n(std::string) R\"__krnl(\n", .{std.fs.path.stem(path)});
 
         var body: Buf = .empty;
         try body.appendSlice(gpa, try self.appendFileContent(path, path));
@@ -471,27 +425,28 @@ const PrimitiveDb = struct {
     }
 
     /// Port of `batch_headers_to_str`. Note that the character budget is not
-    /// reset between headers, matching the original.
+    /// reset between headers, matching the original, and that it measures lines
+    /// as `readlines()` yields them, with their line break.
     fn batchHeadersToStr(self: *Self) ![]const u8 {
         const gpa = self.gpa;
         var res: Buf = .empty;
         var characters: usize = 1;
 
         for (self.batch_headers) |header| {
-            try res.print(gpa, "{{\"{s}\",\n(std::string) R\"-(\n", .{stem(header)});
+            try res.print(gpa, "{{\"{s}\",\n(std::string) R\"-(\n", .{std.fs.path.stem(header)});
             const path = try std.fs.path.join(
                 gpa,
                 &.{ self.kernels_dir, "include", "batch_headers", header },
             );
-            for (try readLines(gpa, try readFile(gpa, self.io, path)), 0..) |line, i| {
+            for (try splitLines(gpa, try readFile(gpa, self.io, path)), 0..) |line, i| {
                 if (std.mem.startsWith(u8, line, "#include")) continue;
-                if ((i + 1) % max_lines == 0 or characters + line.len + 1 > max_characters) {
+                if ((i + 1) % max_lines == 0 or characters + line.len + 2 > max_characters) {
                     try res.appendSlice(gpa, ")-\"\n + (std::string) R\"-(");
                     characters = 0;
                 }
                 try res.appendSlice(gpa, rstrip(line));
                 try res.append(gpa, '\n');
-                characters += line.len + 1;
+                characters += line.len + 2;
             }
             try res.appendSlice(gpa, ")-\"},\n\n");
         }
@@ -522,20 +477,6 @@ fn emitUndef(gpa: Allocator, res: *Buf, guards: Set, field: []const u8) !void {
     const name = field[0 .. std.mem.indexOfScalar(u8, field, '(') orelse field.len];
     if (guards.contains(name)) return;
     try res.print(gpa, "#ifdef {s}\n#undef {s}\n#endif\n", .{ name, name });
-}
-
-/// Port of `reduce_macros`, which is meant to drop `#define`s that nothing uses.
-/// Its liveness test scans every line of the file including the `#define` line
-/// itself, which always contains the macro's own name, so the test never fails
-/// and no line is ever dropped. What is left is the rstrip-and-rejoin it does on
-/// the way through, which is what this reproduces.
-fn reduceMacros(gpa: Allocator, content: []const u8) ![]const u8 {
-    var out: Buf = .empty;
-    for (try splitRaw(gpa, content)) |line| {
-        try out.appendSlice(gpa, rstrip(line));
-        try out.append(gpa, '\n');
-    }
-    return out.items;
 }
 
 /// Port of `post_process_sources`: strips comments, blank lines, line
@@ -577,18 +518,9 @@ fn postProcessSources(gpa: Allocator, content: []const u8) ![]const u8 {
     }
 
     // Drop empty lines, fold line continuations, collapse runs of spaces.
-    const compact = try dropEmptyLines(gpa, out.items);
+    const compact = try dropLines(gpa, out.items, false);
     const folded = try std.mem.replaceOwned(u8, gpa, compact, "\\\n", "");
-
-    var squeezed: Buf = .empty;
-    var j: usize = 0;
-    while (j < folded.len) : (j += 1) {
-        try squeezed.append(gpa, folded[j]);
-        if (folded[j] == ' ') {
-            while (j + 1 < folded.len and folded[j + 1] == ' ') j += 1;
-        }
-    }
-    return squeezed.items;
+    return std.mem.collapseRepeats(u8, folded, ' ');
 }
 
 fn generatePrimitiveDb(
@@ -605,7 +537,7 @@ fn generatePrimitiveDb(
     try db.findAndSetBatchHeaders();
 
     var primitives: Buf = .empty;
-    try primitives.print(gpa, "{s}primitive_db_gen.py{s}", .{ banner_prefix, banner_suffix });
+    try primitives.appendSlice(gpa, banner);
     for (try listKernels(gpa, io, db.kernels_dir, ".cl")) |name| {
         const path = try std.fs.path.join(gpa, &.{ db.kernels_dir, name });
         try primitives.appendSlice(gpa, try db.kernelFileToStr(path));
@@ -613,7 +545,7 @@ fn generatePrimitiveDb(
     try writeOutput(io, out_dir, "ks_primitive_db.inc", primitives.items);
 
     var headers: Buf = .empty;
-    try headers.print(gpa, "{s}primitive_db_gen.py{s}", .{ banner_prefix, banner_suffix });
+    try headers.appendSlice(gpa, banner);
     try headers.appendSlice(gpa, try db.batchHeadersToStr());
     try writeOutput(io, out_dir, "ks_primitive_db_batch_headers.inc", headers.items);
 }
@@ -632,9 +564,7 @@ fn isSqueezed(c: u8) bool {
 
 /// End of the `[^()]*` run starting at `i`.
 fn skipNonParen(s: []const u8, i: usize) usize {
-    var j = i;
-    while (j < s.len and s[j] != '(' and s[j] != ')') j += 1;
-    return j;
+    return std.mem.findAnyPos(u8, s, i, "()") orelse s.len;
 }
 
 /// Port of `minimize_code`: strips comments and squeezes the kernel down to one
@@ -720,10 +650,7 @@ const Include = struct {
 /// `#include\s+"([^"]+)"(\s+\[\[no_opt\]\])?` anchored at `i`.
 fn matchInclude(s: []const u8, i: usize) ?Include {
     if (!startsWithAt(s, i, "#include")) return null;
-    var p = i + "#include".len;
-    const after = skipSpace(s, p);
-    if (after == p) return null;
-    p = after;
+    const p = skipSpace1(s, i + "#include".len) orelse return null;
     if (p >= s.len or s[p] != '"') return null;
     const close = std.mem.indexOfScalarPos(u8, s, p + 1, '"') orelse return null;
     if (close == p + 1) return null;
@@ -792,10 +719,13 @@ const CatMatch = struct {
     body: []const u8,
 };
 
-/// `CAT\s*\(([^()]*(?:\([^()]*\)[^()]*)*)\)`: a `CAT` whose arguments may
-/// contain one level of parentheses. Greedy, without backtracking -- the inputs
-/// never need it.
-fn findCatNested(s: []const u8, from: usize) ?CatMatch {
+/// The next `CAT(...)` at or after `from`. Greedy, without backtracking -- the
+/// inputs never need it. With `nested` this is
+/// `CAT\s*\(([^()]*(?:\([^()]*\)[^()]*)*)\)`, whose arguments may contain any
+/// number of parenthesised groups; without it,
+/// `CAT\s*\(([^()]*|(?:[^()]*\([^\)]*\))[^()]*)\)`, the variant used when
+/// expanding concatenations, which admits one group that may itself hold a `(`.
+fn findCat(s: []const u8, from: usize, comptime nested: bool) ?CatMatch {
     var i = from;
     while (std.mem.indexOfPos(u8, s, i, "CAT")) |at| {
         i = at + 1;
@@ -803,37 +733,18 @@ fn findCatNested(s: []const u8, from: usize) ?CatMatch {
         if (open >= s.len or s[open] != '(') continue;
 
         var p = skipNonParen(s, open + 1);
-        while (p < s.len and s[p] == '(') {
-            const close = skipNonParen(s, p + 1);
-            if (close >= s.len or s[close] != ')') break;
-            p = skipNonParen(s, close + 1);
+        if (nested) {
+            while (p < s.len and s[p] == '(') {
+                const close = skipNonParen(s, p + 1);
+                if (close >= s.len or s[close] != ')') break;
+                p = skipNonParen(s, close + 1);
+            }
+        } else if (p < s.len and s[p] == '(') {
+            const inner = std.mem.indexOfScalarPos(u8, s, p + 1, ')') orelse continue;
+            p = skipNonParen(s, inner + 1);
         }
         if (p >= s.len or s[p] != ')') continue;
         return .{ .start = at, .end = p + 1, .body = s[open + 1 .. p] };
-    }
-    return null;
-}
-
-/// `CAT\s*\(([^()]*|(?:[^()]*\([^\)]*\))[^()]*)\)`: the variant used when
-/// expanding concatenations, whose second branch admits a `(` inside the inner
-/// parentheses.
-fn findCatAlt(s: []const u8, from: usize) ?CatMatch {
-    var i = from;
-    while (std.mem.indexOfPos(u8, s, i, "CAT")) |at| {
-        i = at + 1;
-        const open = skipSpace(s, at + 3);
-        if (open >= s.len or s[open] != '(') continue;
-
-        const first = skipNonParen(s, open + 1);
-        if (first >= s.len) continue;
-        if (s[first] == ')') {
-            return .{ .start = at, .end = first + 1, .body = s[open + 1 .. first] };
-        }
-        const inner = std.mem.indexOfScalarPos(u8, s, first + 1, ')') orelse continue;
-        const tail = skipNonParen(s, inner + 1);
-        if (tail < s.len and s[tail] == ')') {
-            return .{ .start = at, .end = tail + 1, .body = s[open + 1 .. tail] };
-        }
     }
     return null;
 }
@@ -863,7 +774,7 @@ fn expandCat(gpa: Allocator, expression: []const u8) ![]const u8 {
     while (true) {
         var changed = false;
         var i: usize = 0;
-        while (findCatAlt(current, i)) |match| {
+        while (findCat(current, i, false)) |match| {
             i = match.end;
             const parts = try splitOnCommas(gpa, match.body);
             const expanded = try std.mem.concat(gpa, u8, parts);
@@ -881,7 +792,7 @@ fn expandCat(gpa: Allocator, expression: []const u8) ![]const u8 {
 /// the macro's name out of its arguments.
 fn checkCatUsage(gpa: Allocator, macro: []const u8, line: []const u8) !bool {
     var i: usize = 0;
-    while (findCatNested(line, i)) |match| {
+    while (findCat(line, i, true)) |match| {
         i = match.end;
         const parts = try splitOnCommas(gpa, match.body);
         if (parts.len < 2) continue;
@@ -920,9 +831,7 @@ fn definesMacro(macro: []const u8, line: []const u8) bool {
         p += "undef".len;
     } else return false;
 
-    const after = skipSpace(line, p);
-    if (after == p) return false;
-    p = after;
+    p = skipSpace1(line, p) orelse return false;
     if (!startsWithAt(line, p, macro)) return false;
     const end = p + macro.len;
     return end == line.len or !isWord(line[end]);
@@ -940,34 +849,21 @@ fn foundPotentialMacroUser(gpa: Allocator, macro: []const u8, content: []const u
     return false;
 }
 
-const Define = struct {
+const Directive = struct {
     name: []const u8,
+    /// The rest of the line after the name, `\s*(.*)`.
     body: []const u8,
+    /// Where the name ends.
     end: usize,
 };
 
-/// `^#define\s+(\w+)\s*(.*)` anchored at the start of `line`.
-fn parseDefine(line: []const u8) ?Define {
-    if (!std.mem.startsWith(u8, line, "#define")) return null;
-    var p = "#define".len;
-    const after = skipSpace(line, p);
-    if (after == p) return null;
-    p = after;
-    const end = skipWord(line, p);
+/// `^<keyword>\s+(\w+)` anchored at the start of `s`.
+fn parseDirective(s: []const u8, comptime keyword: []const u8) ?Directive {
+    if (!std.mem.startsWith(u8, s, keyword)) return null;
+    const p = skipSpace1(s, keyword.len) orelse return null;
+    const end = skipWord(s, p);
     if (end == p) return null;
-    return .{ .name = line[p..end], .body = line[skipSpace(line, end)..], .end = line.len };
-}
-
-/// `^#undef\s+(\w+)\b` anchored at the start of `line`.
-fn parseUndef(line: []const u8) ?Define {
-    if (!std.mem.startsWith(u8, line, "#undef")) return null;
-    var p = "#undef".len;
-    const after = skipSpace(line, p);
-    if (after == p) return null;
-    p = after;
-    const end = skipWord(line, p);
-    if (end == p) return null;
-    return .{ .name = line[p..end], .body = "", .end = end };
+    return .{ .name = s[p..end], .body = s[skipSpace(s, end)..], .end = end };
 }
 
 /// Port of `remove_unused_macros`: drops `#define`s (and their `#undef`s) that
@@ -975,7 +871,7 @@ fn parseUndef(line: []const u8) ?Define {
 fn removeUnusedMacros(gpa: Allocator, content: []const u8) ![]const u8 {
     var macros: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
     for (try splitLines(gpa, content)) |line| {
-        if (parseDefine(line)) |define| try macros.put(gpa, define.name, define.body);
+        if (parseDirective(line, "#define")) |define| try macros.put(gpa, define.name, define.body);
     }
 
     var used: Set = .empty;
@@ -988,7 +884,7 @@ fn removeUnusedMacros(gpa: Allocator, content: []const u8) ![]const u8 {
         if (macros.contains(expanded)) try used.put(gpa, expanded, {});
     }
     var i: usize = 0;
-    while (findCatAlt(content, i)) |match| {
+    while (findCat(content, i, false)) |match| {
         i = match.end;
         const expanded = try expandCat(gpa, content[match.start..match.end]);
         if (macros.contains(expanded)) try used.put(gpa, expanded, {});
@@ -996,19 +892,19 @@ fn removeUnusedMacros(gpa: Allocator, content: []const u8) ![]const u8 {
 
     var out: List = .empty;
     for (try splitLines(gpa, content)) |line| {
-        if (parseDefine(line)) |define| {
+        if (parseDirective(line, "#define")) |define| {
             const unused = macros.contains(define.name) and !used.contains(define.name);
             try out.append(gpa, if (unused) "" else line);
             continue;
         }
-        if (parseUndef(line)) |undef| {
+        if (parseDirective(line, "#undef")) |undef| {
             const unused = macros.contains(undef.name) and !used.contains(undef.name);
             try out.append(gpa, if (unused) line[undef.end..] else line);
             continue;
         }
         try out.append(gpa, line);
     }
-    return dropBlankLines(gpa, try joinLines(gpa, out.items));
+    return dropLines(gpa, try joinLines(gpa, out.items), true);
 }
 
 /// `#undef\s+name\s*(?:\n|$)` anywhere in `content`.
@@ -1016,13 +912,10 @@ fn hasUndef(content: []const u8, name: []const u8) bool {
     var i: usize = 0;
     while (std.mem.indexOfPos(u8, content, i, "#undef")) |at| {
         i = at + 1;
-        var p = at + "#undef".len;
-        const after = skipSpace(content, p);
-        if (after == p) continue;
-        p = after;
-        if (!startsWithAt(content, p, name)) continue;
+        const undef = parseDirective(content[at..], "#undef") orelse continue;
+        if (!std.mem.eql(u8, undef.name, name)) continue;
 
-        const end = p + name.len;
+        const end = at + undef.end;
         const run = skipSpace(content, end);
         if (run == content.len) return true;
         if (std.mem.indexOfScalar(u8, content[end..run], '\n') != null) return true;
@@ -1037,14 +930,9 @@ fn addMissingUndefs(gpa: Allocator, content: []const u8) ![]const u8 {
     var i: usize = 0;
     while (std.mem.indexOfPos(u8, content, i, "#define")) |at| {
         i = at + 1;
-        var p = at + "#define".len;
-        const after = skipSpace(content, p);
-        if (after == p) continue;
-        p = after;
-        const end = skipWord(content, p);
-        if (end == p) continue;
-        try defines.put(gpa, content[p..end], {});
-        i = end;
+        const define = parseDirective(content[at..], "#define") orelse continue;
+        try defines.put(gpa, define.name, {});
+        i = at + define.end;
     }
 
     var guards = try detectGuardPatterns(gpa, content);
@@ -1083,27 +971,20 @@ fn processFile(
         content = try addMissingUndefs(gpa, content);
     }
 
-    var entry: Buf = .empty;
-    if (content.len > max_length) {
-        var parts: List = .empty;
-        var i: usize = 0;
-        while (i < content.len) : (i += max_length) {
-            const end = @min(i + max_length, content.len);
-            try parts.append(gpa, try std.fmt.allocPrint(
-                gpa,
-                "R\"__krnl({s})__krnl\"",
-                .{content[i..end]},
-            ));
-        }
-        try entry.appendSlice(gpa, try joinLines(gpa, parts.items));
-    } else {
-        try entry.print(gpa, "R\"__krnl({s})__krnl\"", .{content});
+    // One raw string literal per `max_length` chunk; an empty kernel still
+    // gets one.
+    var literals: List = .empty;
+    var i: usize = 0;
+    while (true) : (i += max_length) {
+        const chunk = content[i..@min(i + max_length, content.len)];
+        try literals.append(gpa, try std.fmt.allocPrint(gpa, "R\"__krnl({s})__krnl\"", .{chunk}));
+        if (i + max_length >= content.len) break;
     }
 
     return std.fmt.allocPrint(
         gpa,
         "std::make_pair<std::string_view, std::string_view>(\"{s}\", {s}),\n",
-        .{ stem(path), entry.items },
+        .{ std.fs.path.stem(path), try joinLines(gpa, literals.items) },
     );
 }
 
